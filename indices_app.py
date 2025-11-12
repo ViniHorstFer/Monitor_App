@@ -105,7 +105,7 @@ st.markdown("""
         justify-content: center;
         align-items: center;
         height: 100vh;
-        background-image: url('https://wallpapershome.com/images/pages/pic_h/26287.jpg');
+        background-image: url('https://aquamarine-worthy-zebra-762.mypinata.cloud/ipfs/bafybeia6qj2jol4spdjraxdlohre7yg7wofe33awh2udn6harmg3an4mdq');
         background-size: cover;
         background-position: center;
         background-repeat: no-repeat;
@@ -129,12 +129,12 @@ st.markdown("""
     
     /* Arrow styles */
     .arrow-up {
-        color: #009900;
+        color: #00d500;
         font-size: 24px;
     }
     
     .arrow-down {
-        color: #ad0000;
+        color: #c60000;
         font-size: 24px;
     }
     
@@ -159,6 +159,16 @@ st.markdown("""
 # Initialize session state
 if 'started' not in st.session_state:
     st.session_state.started = False
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+# Authorized users (in production, use encrypted database)
+AUTHORIZED_USERS = {
+    'admin': 'admin123',
+    'vini': 'trader2024',
+    'guest': 'guest123',
+    'trader': 'trader2025'
+}
 
 # Cache data fetching functions
 @st.cache_data(ttl=3600)
@@ -224,7 +234,7 @@ def baixar_indice(indice, name, source, start_date='2020-01-01'):
 @st.cache_data(ttl=3600)
 def load_all_indices():
     """Load all indices data"""
-    with st.spinner('Loading market data...'):
+    with st.spinner('Carregando dados do mercado...'):
         indices_data = {}
         
         # ANBIMA indices
@@ -242,13 +252,12 @@ def load_all_indices():
             try:
                 indices_data[name] = baixar_indice(code, name, 'anbima')
             except Exception as e:
-                st.warning(f"Could not load {name}: {str(e)}")
+                st.warning(f"Não foi possível carregar {name}: {str(e)}")
         
         # Yahoo Finance indices
         yf_indices = [
             ('^BVSP', 'IBOVESPA'),
             ('^GSPC', 'S&P500'),
-            ('XFIX11.SA', 'IFIX'),
             ('BRL=X', 'USD/BRL'),
             ('BTC-USD', 'BITCOIN'),
             ('GLD', 'OURO'),
@@ -259,13 +268,13 @@ def load_all_indices():
             try:
                 indices_data[name] = baixar_indice(code, name, 'yf')
             except Exception as e:
-                st.warning(f"Could not load {name}: {str(e)}")
+                st.warning(f"Não foi possível carregar {name}: {str(e)}")
         
         # CDI
         try:
             indices_data['CDI'] = baixar_indice('CDI', 'CDI', 'cdi')
         except Exception as e:
-            st.warning(f"Could not load CDI: {str(e)}")
+            st.warning(f"Não foi possível carregar CDI: {str(e)}")
         
         return indices_data
 
@@ -336,21 +345,55 @@ def get_daily_variation(df):
     
     return last_date, last_value, prev_date, prev_value, variation
 
-def calc_monthly_returns(indices_data, n_months=12):
-    """Calculate monthly returns for all indices"""
+def calc_monthly_returns(indices_data, n_months=12, method='isolated'):
+    """Calculate monthly returns for all indices
+    Uses last trading day of previous month as baseline for each month
+    method: 'isolated' for month-only returns (each vs last day of previous month)
+           'cumulative' for cumulative from last day before the period starts
+    """
     monthly_returns = {}
     
     for name, df in indices_data.items():
         if df is None or len(df) == 0:
             continue
         
-        # Resample to monthly and calculate returns
-        monthly = df.resample('ME').last()
-        returns = monthly.pct_change() * 100
+        # Get daily data
+        daily_data = df.copy()
         
-        # Get last n months
-        returns = returns.tail(n_months)
-        monthly_returns[name] = returns
+        # Get the last n_months + 1 month-end dates to have baseline
+        monthly_ends = daily_data.resample('ME').last()
+        monthly_period = monthly_ends.tail(n_months + 1)
+        
+        if len(monthly_period) < 2:
+            continue
+        
+        # Create returns series
+        returns_dict = {}
+        
+        for i in range(1, len(monthly_period)):
+            month_end_date = monthly_period.index[i]
+            prev_month_end_value = monthly_period.iloc[i-1, 0]
+            
+            if method == 'isolated':
+                # Each month vs last day of previous month
+                month_end_value = monthly_period.iloc[i, 0]
+                ret = ((month_end_value / prev_month_end_value) - 1) * 100
+            else:  # cumulative
+                # Cumulative from the baseline (last day before period)
+                baseline_value = monthly_period.iloc[0, 0]
+                month_end_value = monthly_period.iloc[i, 0]
+                ret = ((month_end_value / baseline_value) - 1) * 100
+            
+            returns_dict[month_end_date] = ret
+        
+        # Convert to Series
+        returns_series = pd.Series(returns_dict)
+        returns_series.index.name = monthly_period.index.name
+        
+        # Convert to DataFrame to match expected format
+        returns_df = pd.DataFrame(returns_series, columns=[name])
+        
+        monthly_returns[name] = returns_df
     
     return monthly_returns
 
@@ -430,13 +473,98 @@ def create_period_ranking_matrix(indices_data):
     
     return ranking_matrix
 
-def resample_to_weekly(df):
-    """Resample daily data to weekly for cumulative returns"""
-    weekly = df.resample('W-FRI').last()
-    return weekly
+def create_yearly_ranking_matrix(indices_data, method='isolated'):
+    """Create ranking matrix for yearly periods (current year + last 4 years)
+    Uses last trading day of previous year as baseline for each year
+    method: 'isolated' for independent year returns (each vs last day of previous year)
+           'cumulative' for compounded isolated returns year by year
+    """
+    current_year = datetime.now().year
+    years = [current_year - i for i in range(5)]  # Current + 4 previous years
+    years.reverse()  # Oldest to newest
+    
+    # First, calculate isolated returns for ALL years for ALL indices
+    # Using last trading day of previous year as baseline
+    all_isolated_returns = {}
+    
+    for name, df in indices_data.items():
+        if df is None or len(df) == 0:
+            continue
+        
+        isolated_returns = {}
+        
+        for year in years:
+            year_data = df[df.index.year == year]
+            
+            if len(year_data) == 0:
+                continue
+            
+            # Get last trading day of the year
+            year_end_value = year_data.iloc[-1, 0]
+            
+            # Get last trading day of PREVIOUS year as baseline
+            prev_year = year - 1
+            prev_year_data = df[df.index.year == prev_year]
+            
+            if len(prev_year_data) > 0:
+                prev_year_end_value = prev_year_data.iloc[-1, 0]
+                year_return = ((year_end_value / prev_year_end_value) - 1) * 100
+                isolated_returns[year] = year_return
+        
+        all_isolated_returns[name] = isolated_returns
+    
+    # Create ranking matrix
+    max_indices = len(all_isolated_returns)
+    ranking_matrix = pd.DataFrame(index=range(1, max_indices + 1), columns=[str(y) for y in years])
+    
+    # Now populate the matrix based on method
+    for i, year in enumerate(years):
+        year_returns = {}
+        
+        for name, isolated_rets in all_isolated_returns.items():
+            if method == 'isolated':
+                # Just use the isolated return for this year
+                if year in isolated_rets:
+                    ret_val = isolated_rets[year]
+                else:
+                    continue
+            else:  # cumulative
+                # Compound all returns from first year up to this year
+                if i == 0:
+                    # First year: same as isolated
+                    if year in isolated_rets:
+                        ret_val = isolated_rets[year]
+                    else:
+                        continue
+                else:
+                    # Compound returns: (1 + r1) * (1 + r2) * ... * (1 + rn) - 1
+                    cumulative_factor = 1.0
+                    all_years_present = True
+                    
+                    for y in years[:i+1]:  # From first year to current year
+                        if y in isolated_rets:
+                            cumulative_factor *= (1 + isolated_rets[y] / 100)
+                        else:
+                            all_years_present = False
+                            break
+                    
+                    if all_years_present:
+                        ret_val = (cumulative_factor - 1) * 100
+                    else:
+                        continue
+            
+            if pd.notna(ret_val):
+                year_returns[name] = ret_val
+        
+        # Sort and rank
+        sorted_returns = sorted(year_returns.items(), key=lambda x: x[1], reverse=True)
+        for rank, (idx_name, ret_val) in enumerate(sorted_returns, 1):
+            ranking_matrix.loc[rank, str(year)] = f"{idx_name}|{ret_val:.2f}"
+    
+    return ranking_matrix
 
-def calculate_cumulative_returns_weekly(indices_data, selected_indices, period):
-    """Calculate cumulative returns on weekly basis"""
+def calculate_cumulative_returns_daily(indices_data, selected_indices, period):
+    """Calculate cumulative returns on daily basis with ffill for missing days"""
     # Determine start date based on period
     end_date = datetime.now()
     
@@ -450,11 +578,22 @@ def calculate_cumulative_returns_weekly(indices_data, selected_indices, period):
         start_date = end_date - relativedelta(months=24)
     elif period == '36M':
         start_date = end_date - relativedelta(months=36)
+    elif period == 'Tudo':
+        # Find the earliest date across all selected indices
+        earliest_dates = []
+        for idx_name in selected_indices:
+            if idx_name in indices_data and indices_data[idx_name] is not None:
+                earliest_dates.append(indices_data[idx_name].index.min())
+        
+        if earliest_dates:
+            start_date = min(earliest_dates)
+        else:
+            start_date = end_date - relativedelta(months=36)
     else:
         start_date = end_date - relativedelta(months=36)
     
-    cumulative_returns = pd.DataFrame()
-    
+    # Collect all data for selected indices
+    all_data = {}
     for idx_name in selected_indices:
         if idx_name not in indices_data or indices_data[idx_name] is None:
             continue
@@ -467,46 +606,137 @@ def calculate_cumulative_returns_weekly(indices_data, selected_indices, period):
         if len(df) == 0:
             continue
         
-        # Resample to weekly
-        weekly = resample_to_weekly(df)
+        all_data[idx_name] = df
+    
+    if not all_data:
+        return pd.DataFrame()
+    
+    # Get all unique dates from all indices
+    all_dates = set()
+    for df in all_data.values():
+        all_dates.update(df.index)
+    
+    all_dates = sorted(list(all_dates))
+    
+    # Create a unified date range
+    date_range = pd.DatetimeIndex(all_dates)
+    
+    # Calculate cumulative returns for each index
+    cumulative_returns = pd.DataFrame(index=date_range)
+    
+    for idx_name, df in all_data.items():
+        col = df.columns[0]
         
-        # Calculate cumulative returns
-        col = weekly.columns[0]
-        first_value = weekly.iloc[0, 0]
-        weekly_cumret = ((weekly[col] / first_value) - 1) * 100
+        # Reindex to all dates, forward fill prices
+        prices = df[col].reindex(date_range, method='ffill')
         
-        cumulative_returns[idx_name] = weekly_cumret
+        # Calculate daily returns
+        daily_returns = prices.pct_change()
+        
+        # Fill NaN with 0 (0% return when no data and can't ffill)
+        daily_returns = daily_returns.fillna(0)
+        
+        # Calculate cumulative returns from first value
+        first_price = prices.iloc[0]
+        cumulative_returns[idx_name] = ((prices / first_price) - 1) * 100
     
     return cumulative_returns
 
-# Landing Page
+# Landing/Login Page
 def show_landing_page():
+    # Custom CSS for login page matching the uploaded app
     st.markdown("""
-        <div class="landing-container">
-            <h1 class="landing-title">MARKET INDICES DASHBOARD</h1>
-        </div>
+        <style>
+        /* Remove default padding */
+        .main .block-container {
+            padding-top: 2rem;
+            max-width: 100%;
+        }
+        
+        .login-container {
+            max-width: 200px;
+            margin: 30px auto; /* reduced top margin */
+            padding: 40px;
+            background-image: url('https://aquamarine-worthy-zebra-762.mypinata.cloud/ipfs/bafybeigayrnnsuwglzkbhikm32ksvucxecuorcj4k36l4de7na6wcdpjsa');
+            background-size: contain;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-color: black;
+            border: 2px solid #D4AF37;
+            border-radius: 10px;
+            aspect-ratio: 16 / 16;
+        
+
+        .login-title {
+            color: #D4AF37;
+            text-align: center;
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 10px;
+            letter-spacing: 2px;
+            font-family: 'Montserrat', sans-serif;
+        }
+        
+        .login-subtitle {
+            color: #888888;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        
+        /* Full page background */
+        .stApp {
+            background-image: url('https://aquamarine-worthy-zebra-762.mypinata.cloud/ipfs/bafybeia6qj2jol4spdjraxdlohre7yg7wofe33awh2udn6harmg3an4mdq');
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-attachment: fixed;
+        }
+        </style>
     """, unsafe_allow_html=True)
     
-    col1, col2, col3 = st.columns([1, 1, 1])
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
     with col2:
-        if st.button("START", key="start_button", use_container_width=True):
-            st.session_state.started = True
-            st.rerun()
+        st.markdown('<div class="login-container">', unsafe_allow_html=True)
+        st.markdown('<p class="login-title">ÍNDICES DE MERCADO</p>', unsafe_allow_html=True)
+        
+        # Use different keys for input widgets
+        username_input = st.text_input("Usuário", key="login_username_input", placeholder="Digite seu usuário")
+        password_input = st.text_input("Senha", type="password", key="login_password_input", placeholder="Digite sua senha")
+        
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+        with col_btn2:
+            if st.button("ENTRAR", key="login_button", use_container_width=True):
+                if username_input in AUTHORIZED_USERS and AUTHORIZED_USERS[username_input] == password_input:
+                    st.session_state.authenticated = True
+                    st.session_state.started = True
+                    st.session_state.user_logged_in = username_input  # Use different key
+                    st.rerun()
+                else:
+                    st.error("❌ Usuário ou senha inválidos")
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown(
+            "<p style='text-align: center; color: #666; font-size: 12px;'>Acesso autorizado apenas</p>",
+            unsafe_allow_html=True
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # Main Dashboard
 def show_dashboard():
-    st.title("📈 Market Indices Dashboard")
+    st.title("📈 Painel de Índices de Mercado")
     
     # Load data
     indices_data = load_all_indices()
     
     if not indices_data:
-        st.error("No data available. Please check your internet connection.")
+        st.error("Nenhum dado disponível. Por favor, verifique sua conexão com a internet.")
         return
     
     # Sidebar (can be used for other settings later)
-    st.sidebar.title("⚙️ Settings")
-    st.sidebar.info("Use the controls in the main page to customize the chart.")
+    st.sidebar.title("⚙️ Configurações")
+    st.sidebar.info("Use os controles na página principal para personalizar o gráfico.")
     
     available_indices = sorted(list(indices_data.keys()))
     
@@ -514,32 +744,32 @@ def show_dashboard():
     default_indices = ['CDI', 'IBOVESPA', 'S&P500'] if all(x in available_indices for x in ['CDI', 'IBOVESPA', 'S&P500']) else available_indices[:3]
     
     # Main content
-    st.header("📊 Cumulative Returns Chart")
+    st.header("📊 Gráfico de Retornos Acumulados")
     
     # Chart controls in main page
     col1, col2 = st.columns([3, 1])
     
     with col1:
         selected_indices = st.multiselect(
-            "Select Indices",
+            "Selecionar Índices",
             options=available_indices,
             default=default_indices,
-            help="Choose which indices to display on the chart"
+            help="Escolha quais índices exibir no gráfico"
         )
     
     with col2:
         period = st.selectbox(
-            "Select Period",
-            options=['36M', '24M', '12M', 'YTD', 'MTD'],
-            index=0,
-            help="Choose the time period for analysis"
+            "Selecionar Período",
+            options=['Tudo', '36M', '24M', '12M', 'YTD', 'MTD'],
+            index=1,
+            help="Escolha o período de tempo para análise"
         )
     
     st.markdown("---")
-    st.subheader(f"Cumulative Returns ({period})")
+    st.subheader(f"Retornos Acumulados ({period})")
     
     if selected_indices:
-        cumulative_returns = calculate_cumulative_returns_weekly(indices_data, selected_indices, period)
+        cumulative_returns = calculate_cumulative_returns_daily(indices_data, selected_indices, period)
         
         if not cumulative_returns.empty:
             # Create Plotly chart
@@ -565,12 +795,12 @@ def show_dashboard():
                 xaxis=dict(
                     showgrid=True,
                     gridcolor='#333',
-                    title='Date'
+                    title='Data'
                 ),
                 yaxis=dict(
                     showgrid=True,
                     gridcolor='#333',
-                    title='Cumulative Return (%)'
+                    title='Retorno Acumulado (%)'
                 ),
                 hovermode='x unified',
                 legend=dict(
@@ -583,12 +813,12 @@ def show_dashboard():
             
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("No data available for selected indices and period.")
+            st.warning("Nenhum dado disponível para os índices e período selecionados.")
     else:
-        st.info("Please select at least one index from the sidebar.")
+        st.info("Por favor, selecione pelo menos um índice.")
     
     # Rankings side by side
-    st.header("🏆 Performance Rankings")
+    st.header("🏆 Rankings de Performance")
     
     # Calculate all returns
     all_returns = {}
@@ -608,7 +838,15 @@ def show_dashboard():
     
     with col1:
         current_month = calendar.month_name[datetime.now().month]
-        st.subheader(f"🥇 {current_month} Rankings (MTD)")
+        # Translate month names
+        month_pt = {
+            'January': 'Janeiro', 'February': 'Fevereiro', 'March': 'Março',
+            'April': 'Abril', 'May': 'Maio', 'June': 'Junho',
+            'July': 'Julho', 'August': 'Agosto', 'September': 'Setembro',
+            'October': 'Outubro', 'November': 'Novembro', 'December': 'Dezembro'
+        }
+        current_month_pt = month_pt.get(current_month, current_month)
+        st.subheader(f"🥇 Rankings de {current_month_pt} (MTD)")
         
         # Format as table with rank
         mtd_display = mtd_returns.copy()
@@ -618,12 +856,12 @@ def show_dashboard():
         # Create HTML table with colored returns
         html_table = '<table style="width:100%; border-collapse: collapse;">'
         html_table += '<thead><tr style="background-color: #0a0a0a;"><th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Rank</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Index</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Return</th></tr></thead><tbody>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Índice</th>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Retorno</th></tr></thead><tbody>'
         
         for idx_name, row in mtd_display.iterrows():
             ret_val = row['Return']
-            color = '#009900' if ret_val >= 0 else '#ad0000'
+            color = '#00d500' if ret_val >= 0 else '#c60000'
             arrow = '▲' if ret_val >= 0 else '▼'
             html_table += '<tr>'
             html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{int(row["Rank"])}</td>'
@@ -636,7 +874,7 @@ def show_dashboard():
     
     with col2:
         current_year = datetime.now().year
-        st.subheader(f"🥇 {current_year} Rankings (YTD)")
+        st.subheader(f"🥇 Rankings de {current_year} (YTD)")
         
         # Format as table with rank
         ytd_display = ytd_returns.copy()
@@ -646,12 +884,12 @@ def show_dashboard():
         # Create HTML table with colored returns
         html_table = '<table style="width:100%; border-collapse: collapse;">'
         html_table += '<thead><tr style="background-color: #0a0a0a;"><th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Rank</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Index</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Return</th></tr></thead><tbody>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Índice</th>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Retorno</th></tr></thead><tbody>'
         
         for idx_name, row in ytd_display.iterrows():
             ret_val = row['Return']
-            color = '#009900' if ret_val >= 0 else '#ad0000'
+            color = '#00d500' if ret_val >= 0 else '#c60000'
             arrow = '▲' if ret_val >= 0 else '▼'
             html_table += '<tr>'
             html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{int(row["Rank"])}</td>'
@@ -663,7 +901,7 @@ def show_dashboard():
         st.markdown(html_table, unsafe_allow_html=True)
     
     # Variation Monitor
-    st.header("📡 Daily Variation Monitor")
+    st.header("📡 Monitor de Variação Diária")
     
     variation_data = []
     for name, df in indices_data.items():
@@ -689,17 +927,17 @@ def show_dashboard():
         # Create HTML table with colored variations
         html_table = '<table style="width:100%; border-collapse: collapse;">'
         html_table += '<thead><tr style="background-color: #0a0a0a;">'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Index</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Previous Date</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Previous Value</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Last Date</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Last Value</th>'
-        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Variation</th>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Índice</th>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Data Anterior</th>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Valor Anterior</th>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Última Data</th>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Último Valor</th>'
+        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Variação</th>'
         html_table += '</tr></thead><tbody>'
         
         for _, row in var_df.iterrows():
             variation = row['Variation (%)']
-            color = '#009900' if variation >= 0 else '#ad0000'
+            color = '#00d500' if variation >= 0 else '#c60000'
             arrow = '▲' if variation >= 0 else '▼'
             
             html_table += '<tr>'
@@ -714,18 +952,46 @@ def show_dashboard():
         html_table += '</tbody></table>'
         st.markdown(html_table, unsafe_allow_html=True)
     else:
-        st.warning("Insufficient data for variation monitor.")
+        st.warning("Dados insuficientes para o monitor de variação.")
     
     # Monthly Ranking Matrix
-    st.header("📅 Monthly Performance Matrix (Last 12 Months)")
+    st.header("📅 Matriz de Performance Mensal (Últimos 12 Meses)")
     
-    monthly_returns = calc_monthly_returns(indices_data, n_months=12)
+    # Radio button for calculation method
+    monthly_method = st.radio(
+        "Selecione o método de cálculo:",
+        options=['Retornos Mensais Isolados', 'Retornos Acumulados (até o fim do mês)'],
+        index=0,
+        horizontal=True,
+        key='monthly_method'
+    )
+    
+    method_key = 'isolated' if monthly_method == 'Retornos Mensais Isolados' else 'cumulative'
+    
+    monthly_returns = calc_monthly_returns(indices_data, n_months=12, method=method_key)
     monthly_ranking = create_monthly_ranking_matrix(monthly_returns)
     
     if monthly_ranking is not None:
         # Assign colors to indices
         unique_indices = list(indices_data.keys())
-        color_palette = px.colors.qualitative.Set3 + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
+        color_palette = [
+            "#1f77b4",  # strong blue
+            "#9467bd",  # violet
+            "#f3710f",  # cyan
+            "#fff12f",  # olive yellow
+            "#FDACF1",  # medium gray
+            "#b06c5f",  # muted brown
+            "#de5db7",  # pink (far from red)
+            "#9f5495",  # purple
+            "#9edae5",  # pale turquoise
+            "#ffffff",  # lavender
+            "#ffbb78",  # peach (orange but not red)
+            "#dbdb8d",  # sand
+            "#757575",  # light blue
+            "#393b79"   # dark indigo
+        ]
+
+
         index_colors = {idx: color_palette[i % len(color_palette)] for i, idx in enumerate(unique_indices)}
         
         # Create colored HTML table
@@ -748,7 +1014,7 @@ def show_dashboard():
                     bg_color = index_colors.get(idx_name, '#1a1a1a')
                     
                     # Color the return value
-                    ret_color = '#009900' if ret_val >= 0 else '#ad0000'
+                    ret_color = "#00d500" if ret_val >= 0 else "#c60000"
                     arrow = '▲' if ret_val >= 0 else '▼'
                     
                     html_table += f'<td style="border: 1px solid #333; padding: 8px; text-align: center; background-color: {bg_color};">'
@@ -764,35 +1030,46 @@ def show_dashboard():
         
         st.markdown(html_table, unsafe_allow_html=True)
     else:
-        st.warning("Unable to create monthly ranking matrix.")
+        st.warning("Não foi possível criar a matriz de ranking mensal.")
     
-    # Period Ranking Matrix
-    st.header("🎯 Cumulative Performance Matrix (Multi-Period)")
+    # Yearly Ranking Matrix
+    st.header("🎯 Matriz de Performance Anual (Multi-Período)")
     
-    period_ranking = create_period_ranking_matrix(indices_data)
+    # Radio button for calculation method
+    yearly_method = st.radio(
+        "Selecione o método de cálculo:",
+        options=['Retornos Anuais Isolados', 'Retornos Acumulados (até o fim do ano)'],
+        index=0,
+        horizontal=True,
+        key='yearly_method'
+    )
     
-    if period_ranking is not None:
+    yearly_method_key = 'isolated' if yearly_method == 'Retornos Anuais Isolados' else 'cumulative'
+    
+    yearly_ranking = create_yearly_ranking_matrix(indices_data, method=yearly_method_key)
+    
+    if yearly_ranking is not None:
         # Create colored HTML table
         html_table = '<table style="width:100%; border-collapse: collapse; font-size: 13px; margin-top: 20px;">'
         html_table += '<thead><tr style="background-color: #0a0a0a;"><th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Rank</th>'
         
-        for col in period_ranking.columns:
+        for col in yearly_ranking.columns:
             html_table += f'<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">{col}</th>'
         html_table += '</tr></thead><tbody>'
         
-        for idx in period_ranking.index:
+        for idx in yearly_ranking.index:
             html_table += '<tr>'
             html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37; font-weight: bold;">{idx}</td>'
             
-            for col in period_ranking.columns:
-                value = period_ranking.loc[idx, col]
+            for col in yearly_ranking.columns:
+                value = yearly_ranking.loc[idx, col]
                 if pd.notna(value) and '|' in str(value):
                     idx_name, ret_str = value.split('|')
                     ret_val = float(ret_str)
                     bg_color = index_colors.get(idx_name, '#1a1a1a')
                     
                     # Color the return value
-                    ret_color = "#009900" if ret_val >= 0 else '#ad0000'
+                    ret_color = '#00d500' if ret_val >= 0 else '#c60000'
                     arrow = '▲' if ret_val >= 0 else '▼'
                     
                     html_table += f'<td style="border: 1px solid #333; padding: 8px; text-align: center; background-color: {bg_color};">'
@@ -808,17 +1085,17 @@ def show_dashboard():
         
         st.markdown(html_table, unsafe_allow_html=True)
     else:
-        st.warning("Unable to create period ranking matrix.")
+        st.warning("Não foi possível criar a matriz de ranking anual.")
     
     # Footer
     st.markdown("---")
     st.markdown(
-        "<p style='text-align: center; color: #d4af37; font-family: Montserrat;'>Data sources: ANBIMA, Yahoo Finance, Brazilian Central Bank</p>",
+        "<p style='text-align: center; color: #d4af37; font-family: Montserrat;'>Fontes de dados: ANBIMA, Yahoo Finance, Banco Central do Brasil</p>",
         unsafe_allow_html=True
     )
 
 # Main app logic
-if not st.session_state.started:
+if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
