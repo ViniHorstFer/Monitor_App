@@ -443,88 +443,6 @@ def baixar_indice(indice, name, source, start_date='2015-01-01'):
         else:
             st.error(f"Erro ao acessar API CDI: {response.status_code}")
             return pd.DataFrame()
-    
-    elif source == 'b3':
-        chrome_options = Options()
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-
-        # Folder to save CSV
-        download_dir = os.path.join(os.getcwd(), "downloads")
-        os.makedirs(download_dir, exist_ok=True)
-
-        prefs = {
-            "download.default_directory": download_dir,
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-            "safebrowsing.enabled": True
-        }
-        chrome_options.add_experimental_option("prefs", prefs)
-
-        # ------------------ DRIVER ------------------
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-        wait = WebDriverWait(driver, 20)
-
-        try:
-            # Step 1. Access IFIX Monthly Evolution page directly
-            url = "https://sistemaswebb3-listados.b3.com.br/indexStatisticsPage/monthly-evolution/IFIX?language=pt-br"
-            driver.get(url)
-
-            # Step 2. Wait for and click "Download (período selecionado)"
-            download_link = wait.until(EC.element_to_be_clickable(
-                (By.XPATH, "//a[contains(@href, '/indexStatisticsPage/monthly-evolution/IFIX/monthly-evolution/IFIX')]")
-            ))
-            driver.execute_script("arguments[0].click();", download_link)
-            time.sleep(10)  # wait for download to finish
-
-            # Step 3. Find and load the CSV into pandas
-            csv_files = [f for f in os.listdir(download_dir) if f.endswith(".csv")]
-            if not csv_files:
-                raise FileNotFoundError("No CSV file downloaded.")
-            
-            csv_path = os.path.join(download_dir, csv_files[0])
-            ifix_df = pd.read_csv(csv_path, sep=';', encoding='latin1')
-            ifix_df = ifix_df.iloc[1:, :]
-            ifix_df.index = ifix_df.index.map(lambda x: f"{x[0]}/{x[1]}")
-            ifix_df.index = pd.to_datetime(ifix_df.index)
-
-            from pandas.tseries.offsets import BMonthEnd
-
-            def get_last_trading_day(date):
-                """Get last trading day for a given month date"""
-                today = pd.Timestamp.today().normalize()
-                
-                # Get last business day of the month
-                last_bday = date + BMonthEnd()
-                
-                # If it's the current month and last business day is in the future
-                if last_bday.year == today.year and last_bday.month == today.month:
-                    if last_bday >= today:
-                        # Return last business day before today
-                        return today - pd.offsets.BDay(1)
-                
-                return last_bday
-
-            ifix_df.index = [get_last_trading_day(date) for date in ifix_df.index]
-
-            ifix_df.columns = ['IFIX']
-
-            ifix_df['IFIX'] = pd.to_numeric(
-                                ifix_df['IFIX'].astype(str)
-                                .str.replace('.', '', regex=False)
-                                .str.replace(',', '.', regex=False),
-                                errors='coerce'
-                            )
-
-            return ifix_df.loc[ifix_df.index > start_date]
-
-        except Exception as e:
-            st.error(f"Erro ao acessar IFIX.")
-            return pd.DataFrame()
-        
-        finally:
-            driver.quit()
 
 @st.cache_data(ttl=3600)
 def load_all_indices():
@@ -1585,3 +1503,4 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
