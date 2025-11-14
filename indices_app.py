@@ -156,197 +156,6 @@ AUTHORIZED_USERS = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ANBIMA CURVES FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# B3 holidays for 2025
-HOLIDAYS_2025 = [
-    datetime(2025, 1, 1), datetime(2025, 3, 3), datetime(2025, 3, 4),
-    datetime(2025, 4, 18), datetime(2025, 4, 21), datetime(2025, 5, 1),
-    datetime(2025, 6, 19), datetime(2025, 11, 15), datetime(2025, 11, 20),
-    datetime(2025, 12, 24), datetime(2025, 12, 25), datetime(2025, 12, 31),
-]
-
-def is_trading_day(date):
-    """Check if date is a trading day"""
-    return date.weekday() < 5 and date not in HOLIDAYS_2025
-
-def get_previous_trading_days(start_date, n=6):
-    """Return list of previous n trading days"""
-    days = []
-    current = start_date - timedelta(days=1)
-    while len(days) < n:
-        if is_trading_day(current):
-            days.append(current)
-        current -= timedelta(days=1)
-    return list(reversed(days))
-
-@st.cache_data(ttl=3600)
-def fetch_anbima_curve_for_date(target_date):
-    """Fetch yield curve for given date using headless Chrome"""
-    date_str = target_date.strftime('%d%m%Y')
-    
-    # Setup headless Chrome
-    chrome_options = Options()
-    chrome_options.add_argument('--headless')  # Run in background
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--window-size=1920,1080')
-    
-    driver = webdriver.Chrome(options=chrome_options)
-    
-    try:
-        driver.get('https://www.anbima.com.br/pt_br/informar/curvas-de-juros-fechamento.htm')
-        
-        # Wait for and switch to iframe
-        WebDriverWait(driver, 10).until(
-            EC.frame_to_be_available_and_switch_to_it((By.TAG_NAME, "iframe"))
-        )
-        
-        # Fill date input
-        input_field = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.NAME, 'Dt_Ref'))
-        )
-        input_field.clear()
-        input_field.send_keys(date_str)
-        input_field.send_keys(Keys.TAB)
-        time.sleep(1)
-        
-        # Click Consultar
-        consult_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.NAME, 'Consultar'))
-        )
-        consult_button.click()
-        
-        # Wait for results
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, 'ETTJs'))
-        )
-        
-        # Extract table HTML
-        div = driver.find_element(By.ID, 'ETTJs')
-        table_html = div.get_attribute('innerHTML')
-        
-        # Parse table
-        df = pd.read_html(StringIO(table_html), header=0)[0]
-        
-        vertices = (
-            df.rename(columns=df.iloc[0])
-            .iloc[1:, :]
-            .set_index('Vértices')
-            .apply(pd.to_numeric, errors='coerce')
-        )
-        
-        vertices.rename_axis(target_date.strftime('%Y-%m-%d'), inplace=True)
-        
-        vertices.index = (
-            vertices.index
-            .str.replace('.', '', regex=False)
-            .astype(int)
-        )
-        
-        return vertices
-        
-    finally:
-        driver.quit()
-
-@st.cache_data(ttl=3600)
-def load_anbima_curves():
-    """Load ANBIMA curves for last 6 trading days"""
-    today = datetime.today()
-    trading_days = get_previous_trading_days(today, 6)
-    
-    all_data = []
-    with st.spinner('Carregando curvas ANBIMA...'):
-        for date in trading_days:
-            try:
-                df = fetch_anbima_curve_for_date(date)
-                all_data.append(df)
-            except Exception as e:
-                st.warning(f"Erro ao carregar dados de {date.strftime('%Y-%m-%d')}: {str(e)}")
-    
-    return all_data
-
-def create_table(all_data, index_name):
-    """Create table with rates for each vertex and date"""
-    if not all_data:
-        return None
-    
-    rates = []
-    dates = []
-
-    for n in range(0, len(all_data)):
-        rates.append(all_data[n][index_name].dropna())
-        dates.append(all_data[n].index.name)
-
-    rates_df = pd.DataFrame(rates, index=dates).T
-    rates_df.rename_axis('Vértice (Anos)', inplace=True)
-    rates_df.index = (rates_df.index / 252).astype(int)
-
-    return rates_df / 10000
-
-def create_chart(all_data, index_name):
-    """Create chart for index curve"""
-    if not all_data:
-        return None
-    
-    fig = go.Figure()
-    
-    colors = px.colors.qualitative.Set3 + px.colors.qualitative.Pastel
-    
-    for i in range(len(all_data)):
-        data = all_data[i][index_name].dropna()
-        fig.add_trace(go.Scatter(
-            x=data.index / 252,
-            y=data / 10000,
-            mode='lines+markers',
-            line=dict(shape='spline', width=2.5, color=colors[i % len(colors)]),
-            name=data.index.name
-        ))
-    
-    fig.update_layout(
-        title=index_name,
-        xaxis_title='Vértice (Anos)',
-        yaxis_title='Taxa (%)',
-        plot_bgcolor='#0a0a0a',
-        paper_bgcolor='#1a1a1a',
-        font=dict(color='#d4af37', family='Montserrat'),
-        xaxis=dict(showgrid=True, gridcolor='#333'),
-        yaxis=dict(showgrid=True, gridcolor='#333'),
-        legend=dict(bgcolor='#1a1a1a', bordercolor='#d4af37', borderwidth=1),
-        height=500
-    )
-    
-    return fig
-
-def calculate_rate_variations(all_data, index_name):
-    """Calculate rate variations for different periods"""
-    if not all_data or len(all_data) < 2:
-        return {}
-    
-    # Get latest rates (newest day)
-    latest_data = all_data[-1][index_name].dropna() / 10000
-    
-    variations = {}
-    
-    for days_back in range(1, min(6, len(all_data))):
-        past_data = all_data[-(days_back + 1)][index_name].dropna() / 10000
-        
-        # Calculate variation for each vertex
-        var_dict = {}
-        for vertex in latest_data.index:
-            if vertex in past_data.index:
-                variation = latest_data[vertex] - past_data[vertex]
-                var_dict[vertex] = variation
-        
-        # Get top 10 by absolute value
-        sorted_vars = sorted(var_dict.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
-        variations[days_back] = sorted_vars
-    
-    return variations
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # TESOURO DIRETO FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -388,11 +197,11 @@ def create_td_chart(products_df, selected_dates, bond_name):
         if date in products_df.index:
             rates = products_df.loc[date].dropna()
             if len(rates) > 0:
-                # Convert maturity dates to years from now
-                maturities = [(pd.Timestamp(mat) - pd.Timestamp.now()).days / 365.25 for mat in rates.index]
+                # Extract years from maturity dates
+                maturity_years = [pd.Timestamp(mat).year for mat in rates.index]
                 
                 fig.add_trace(go.Scatter(
-                    x=maturities,
+                    x=maturity_years,
                     y=rates.values,
                     mode='lines+markers',
                     name=str(date),
@@ -401,8 +210,7 @@ def create_td_chart(products_df, selected_dates, bond_name):
                 ))
     
     fig.update_layout(
-        title=f'Curva de Taxas - {bond_name}',
-        xaxis_title='Anos até o Vencimento',
+        xaxis_title='Ano de Vencimento',
         yaxis_title='Taxa (%)',
         plot_bgcolor='#0a0a0a',
         paper_bgcolor='#1a1a1a',
@@ -452,13 +260,142 @@ def create_td_table(products_df):
     # Reverse order: oldest dates first (ascending index), newest maturities first (descending columns)
     table_df = products_df.copy()
     table_df = table_df.sort_index(ascending=True)  # Oldest dates first
-    table_df = table_df[sorted(table_df.columns, reverse=True)]  # Newest maturities first
+    table_df = table_df[sorted(table_df.columns, reverse=False)]  # Newest maturities first
     
     # Format dates for display
     table_df.index = [str(date) for date in table_df.index]
     table_df.columns = [str(date) for date in table_df.columns]
     
     return table_df
+
+def get_maturity_time_series(td_df, bond, maturity_date):
+    """Get complete time series for a specific maturity date"""
+    df = td_df[td_df['Tipo Titulo'] == bond].copy()
+    df = df[df['Data Vencimento'] == maturity_date]
+    df = df.sort_values('Data Base')
+    df.set_index('Data Base', inplace=True)
+    
+    # Extract rates
+    rates = pd.to_numeric(df['Taxa Compra Manha'].astype(str).str.replace(',', '.', regex=False), errors='coerce')
+    
+    return rates
+
+def get_all_maturities_time_series(td_df, bond):
+    """Get time series for all current maturities of a bond"""
+    df = td_df[td_df['Tipo Titulo'] == bond].copy()
+    
+    # Get current maturities (those available in recent data)
+    recent_dates = np.sort(pd.unique(df['Data Base']))[-10:]
+    recent_df = df[df['Data Base'].isin(recent_dates)]
+    # Sort in descending order (newest maturity first)
+    current_maturities = sorted(pd.unique(recent_df['Data Vencimento']), reverse=False)
+    
+    # Get time series for each maturity
+    time_series_dict = {}
+    for maturity in current_maturities:
+        series = get_maturity_time_series(td_df, bond, maturity)
+        if len(series) > 0:
+            time_series_dict[maturity] = series
+    
+    return time_series_dict
+
+def create_maturity_time_series_chart(time_series, maturity_date, bond_name):
+    """Create time series chart for a specific maturity with percentile lines"""
+    fig = go.Figure()
+    
+    if len(time_series) > 0:
+        # Convert dates to datetime for plotting
+        dates = [pd.Timestamp(d) for d in time_series.index]
+        
+        # Calculate percentiles
+        p25 = time_series.quantile(0.25)
+        p50 = time_series.quantile(0.50)
+        p75 = time_series.quantile(0.75)
+        
+        # Add main time series line
+        fig.add_trace(go.Scatter(
+            x=dates,
+            y=time_series.values,
+            mode='lines',
+            name=f'Vencimento {maturity_date.year}',
+            line=dict(width=2, color='#d4af37'),
+            marker=dict(size=6, color='#d4af37')
+        ))
+        
+        # Add 25th percentile line
+        fig.add_trace(go.Scatter(
+            x=[dates[0], dates[-1]],
+            y=[p25, p25],
+            mode='lines',
+            name=f'P25: {p25:.2f}%',
+            line=dict(width=2, color='#4169E1', dash='dash'),
+            showlegend=True
+        ))
+        
+        # Add 50th percentile (median) line
+        fig.add_trace(go.Scatter(
+            x=[dates[0], dates[-1]],
+            y=[p50, p50],
+            mode='lines',
+            name=f'P50: {p50:.2f}%',
+            line=dict(width=2, color='#32CD32', dash='dash'),
+            showlegend=True
+        ))
+        
+        # Add 75th percentile line
+        fig.add_trace(go.Scatter(
+            x=[dates[0], dates[-1]],
+            y=[p75, p75],
+            mode='lines',
+            name=f'P75: {p75:.2f}%',
+            line=dict(width=2, color='#FF6347', dash='dash'),
+            showlegend=True
+        ))
+        
+        # Add annotations for percentiles on the right side
+        fig.add_annotation(
+            x=dates[-1],
+            y=p25,
+            text=f"P25: {p25:.2f}%",
+            showarrow=False,
+            xanchor='left',
+            xshift=10,
+            font=dict(size=10, color='#4169E1')
+        )
+        
+        fig.add_annotation(
+            x=dates[-1],
+            y=p50,
+            text=f"P50: {p50:.2f}%",
+            showarrow=False,
+            xanchor='left',
+            xshift=10,
+            font=dict(size=10, color='#32CD32')
+        )
+        
+        fig.add_annotation(
+            x=dates[-1],
+            y=p75,
+            text=f"P75: {p75:.2f}%",
+            showarrow=False,
+            xanchor='left',
+            xshift=10,
+            font=dict(size=10, color='#FF6347')
+        )
+    
+    fig.update_layout(
+        xaxis_title='Dia de Negociação',
+        yaxis_title='Taxa (%)',
+        plot_bgcolor='#0a0a0a',
+        paper_bgcolor='#1a1a1a',
+        font=dict(color='#d4af37', family='Montserrat'),
+        xaxis=dict(showgrid=True, gridcolor='#333'),
+        yaxis=dict(showgrid=True, gridcolor='#333'),
+        legend=dict(bgcolor='#1a1a1a', bordercolor='#d4af37', borderwidth=1),
+        height=500
+    )
+    
+    return fig
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MARKET INDICES FUNCTIONS (from original code)
@@ -640,12 +577,6 @@ def load_all_indices():
             indices_data['CDI'] = baixar_indice('CDI', 'CDI', 'bcb')
         except Exception as e:
             st.warning(f"Não foi possível carregar CDI: {str(e)}")
-
-        #IFIX
-        try:
-            indices_data['IFIX'] = baixar_indice('IFIX', 'IFIX', 'b3')
-        except Exception as e:
-            st.warning(f"Não foi possível carregar IFIX: {str(e)}")
         
         # Create S&P 500 (BRL) by multiplying S&P 500 (USD) by USD/BRL exchange rate
         if 'S&P 500 (USD)' in indices_data and 'USD/BRL' in indices_data:
@@ -1057,7 +988,7 @@ def show_dashboard():
     st.title("📈 Painel de Índices de Mercado")
     
     # Create tabs
-    tab1, tab2, tab3 = st.tabs(["Análise de Índices", "Curvas Anbima", "Tesouro Direto"])
+    tab1, tab3 = st.tabs(["Análise de Índices", "Tesouro Direto"])
     
     # ═══════════════════════════════════════════════════════════════════════════
     # TAB 1: ANÁLISE DE ÍNDICES
@@ -1391,186 +1322,6 @@ def show_dashboard():
         )
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # TAB 2: CURVAS ANBIMA
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    with tab2:
-        st.header("📈 Análise de Curvas ANBIMA")
-        
-        # Buttons to select index
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("ETTJ IPCA", use_container_width=True, key="btn_ipca"):
-                st.session_state.selected_curve = 'ETTJ IPCA'
-        
-        with col2:
-            if st.button("ETTJ PRE", use_container_width=True, key="btn_pre"):
-                st.session_state.selected_curve = 'ETTJ PRE'
-        
-        with col3:
-            if st.button("Inflação Implícita", use_container_width=True, key="btn_inflacao"):
-                st.session_state.selected_curve = 'Inflação Implícita'
-        
-        # Initialize selected curve if not set
-        if 'selected_curve' not in st.session_state:
-            st.session_state.selected_curve = 'ETTJ IPCA'
-        
-        selected_curve = st.session_state.selected_curve
-        
-        st.subheader(f"Curva Selecionada: {selected_curve}")
-        
-        # Load ANBIMA data
-        all_data = load_anbima_curves()
-        
-        if all_data:
-            # 1. Display curve chart
-            st.markdown("### 📊 Gráfico da Curva")
-            fig = create_chart(all_data, selected_curve)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # 2. Calculate and display rate variations
-            st.markdown("### 📉 Variações de Taxas (10 maiores em ordem)")
-            
-            variations = calculate_rate_variations(all_data, selected_curve)
-            
-            if variations:
-                # Create columns for different periods
-                cols = st.columns(min(5, len(variations)))
-                
-                for i, (days_back, var_list) in enumerate(sorted(variations.items())):
-                    if i < len(cols):
-                        with cols[i]:
-                            st.markdown(f"#### Variação de {days_back} Dia{'s' if days_back > 1 else ''}")
-                            
-                            # Create HTML table for this period
-                            html_table = '<table style="width:100%; border-collapse: collapse; font-size: 12px;">'
-                            html_table += '<thead><tr style="background-color: #0a0a0a;">'
-                            html_table += '<th style="border: 1px solid #d4af37; padding: 8px; color: #d4af37;">Vértice</th>'
-                            html_table += '<th style="border: 1px solid #d4af37; padding: 8px; color: #d4af37;">Variação (p.p.)</th>'
-                            html_table += '</tr></thead><tbody>'
-                            
-                            for vertex, variation in var_list:
-                                color = "#00e100" if variation >= 0 else "#f20000"
-                                arrow = '▲' if variation >= 0 else '▼'
-                                vertex_years = vertex / 252
-                                
-                                html_table += '<tr>'
-                                html_table += f'<td style="border: 1px solid #333; padding: 6px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{vertex_years:.2f}</td>'
-                                html_table += f'<td style="border: 1px solid #333; padding: 6px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {abs(variation):.4f}%</td>'
-                                html_table += '</tr>'
-                            
-                            html_table += '</tbody></table>'
-                            st.markdown(html_table, unsafe_allow_html=True)
-            
-            st.markdown(f"### 📋 Tabela de Taxas - {selected_curve}")
-            
-            rates_table = create_table(all_data, selected_curve)
-            if rates_table is not None:
-                st.dataframe(rates_table, use_container_width=True, height=400)
-            else:
-                st.warning("Não foi possível criar a tabela de taxas.")
-            
-            # 4. Two-day comparison feature
-            st.markdown("### 🔄 Comparação Entre Dois Dias")
-            
-            # Get available dates
-            available_dates = [data.index.name for data in all_data]
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                date1 = st.selectbox(
-                    "Selecione o Dia Mais Antigo",
-                    options=available_dates,
-                    index=0,
-                    key='comparison_date1'
-                )
-            
-            with col2:
-                date2 = st.selectbox(
-                    "Selecione o Dia Mais Recente",
-                    options=available_dates,
-                    index=len(available_dates) - 1,
-                    key='comparison_date2'
-                )
-            
-            if st.button("Gerar Comparação", use_container_width=False):
-                # Find the data for selected dates
-                data1 = None
-                data2 = None
-                
-                for data in all_data:
-                    if data.index.name == date1:
-                        data1 = data
-                    if data.index.name == date2:
-                        data2 = data
-                
-                if data1 is not None and data2 is not None:
-                    # Get data for selected curve
-                    curve1 = data1[selected_curve].dropna() / 10000
-                    curve2 = data2[selected_curve].dropna() / 10000
-                    
-                    # Find common vertices
-                    common_vertices = sorted(set(curve1.index).intersection(set(curve2.index)))
-                    
-                    if common_vertices:
-                        # Create comparison table
-                        st.markdown(f"#### Comparação: {date1} vs {date2}")
-                        
-                        html_table = '<table style="width:100%; border-collapse: collapse; font-size: 13px;">'
-                        html_table += '<thead><tr style="background-color: #0a0a0a;">'
-                        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Vértice (Anos)</th>'
-                        html_table += f'<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">{date1}</th>'
-                        html_table += f'<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">{date2}</th>'
-                        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Variação (p.p.)</th>'
-                        html_table += '</tr></thead><tbody>'
-                        
-                        for vertex in common_vertices:
-                            rate1 = curve1[vertex]
-                            rate2 = curve2[vertex]
-                            variation = rate2 - rate1
-                            
-                            vertex_years = vertex / 252
-                            color = '#00e100' if variation >= 0 else "#f20000"
-                            arrow = '▲' if variation >= 0 else '▼'
-                            
-                            html_table += '<tr>'
-                            html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37; font-weight: bold;">{vertex_years:.2f}</td>'
-                            html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: #d4af37;">{rate1:.4f}%</td>'
-                            html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: #d4af37;">{rate2:.4f}%</td>'
-                            html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {abs(variation):.4f}%</td>'
-                            html_table += '</tr>'
-                        
-                        html_table += '</tbody></table>'
-                        st.markdown(html_table, unsafe_allow_html=True)
-                        
-                        # Summary statistics
-                        st.markdown("#### Estatísticas da Comparação")
-                        col1, col2, col3, col4 = st.columns(4)
-                        
-                        variations_list = [curve2[v] - curve1[v] for v in common_vertices]
-                        avg_variation = np.mean(variations_list)
-                        max_variation = max(variations_list)
-                        min_variation = min(variations_list)
-                        
-                        with col1:
-                            st.metric("Variação Média (p.p.)", f"{avg_variation:.4f}%")
-                        with col2:
-                            st.metric("Variação Máxima (p.p.)", f"{max_variation:.4f}%")
-                        with col3:
-                            st.metric("Variação Mínima (p.p.)", f"{min_variation:.4f}%")
-                        with col4:
-                            st.metric("Nº de Vértices (p.p.)", len(common_vertices))
-                    else:
-                        st.warning("Não há vértices comuns entre os dias selecionados.")
-                else:
-                    st.error("Erro ao carregar dados dos dias selecionados.")
-        else:
-            st.warning("Não foi possível carregar os dados das curvas ANBIMA. Verifique sua conexão.")
-    
-    # ═══════════════════════════════════════════════════════════════════════════
     # TAB 3: TESOURO DIRETO
     # ═══════════════════════════════════════════════════════════════════════════
     
@@ -1585,9 +1336,9 @@ def show_dashboard():
             bond_types = [
                 'Tesouro Selic',
                 'Tesouro Prefixado',
+                'Tesouro Prefixado com Juros Semestrais',
                 'Tesouro IPCA+ com Juros Semestrais',
                 'Tesouro IPCA+',
-                'Tesouro Prefixado com Juros Semestrais',
                 'Tesouro Renda+ Aposentadoria Extra'
             ]
             
@@ -1596,8 +1347,8 @@ def show_dashboard():
             with col1:
                 if st.button("Tesouro Selic", use_container_width=True, key="btn_selic"):
                     st.session_state.selected_bond = 'Tesouro Selic'
-                if st.button("Tesouro IPCA+", use_container_width=True, key="btn_ipca_td"):
-                    st.session_state.selected_bond = 'Tesouro IPCA+'
+                if st.button("Tesouro Renda+", use_container_width=True, key="btn_renda"):
+                    st.session_state.selected_bond = 'Tesouro Renda+ Aposentadoria Extra'
             
             with col2:
                 if st.button("Tesouro Prefixado", use_container_width=True, key="btn_pre_td"):
@@ -1606,10 +1357,10 @@ def show_dashboard():
                     st.session_state.selected_bond = 'Tesouro Prefixado com Juros Semestrais'
             
             with col3:
+                if st.button("Tesouro IPCA+", use_container_width=True, key="btn_ipca_td"):
+                    st.session_state.selected_bond = 'Tesouro IPCA+'
                 if st.button("Tesouro IPCA+ com Juros", use_container_width=True, key="btn_ipca_juros"):
                     st.session_state.selected_bond = 'Tesouro IPCA+ com Juros Semestrais'
-                if st.button("Tesouro Renda+", use_container_width=True, key="btn_renda"):
-                    st.session_state.selected_bond = 'Tesouro Renda+ Aposentadoria Extra'
             
             # Initialize selected bond if not set
             if 'selected_bond' not in st.session_state:
@@ -1645,6 +1396,71 @@ def show_dashboard():
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.warning("Selecione pelo menos um dia para exibir o gráfico.")
+                
+                # 1.5. Display time series chart for each maturity
+                st.markdown("### 📈 Série Histórica de Taxas por Vencimento")
+                
+                # Get all time series for current maturities
+                all_time_series = get_all_maturities_time_series(td_df, selected_bond)
+                
+                if all_time_series:
+                    
+                    # Get maturities (already sorted in descending order from get_all_maturities_time_series)
+                    # So first element is the newest maturity
+                    sorted_maturities = list(all_time_series.keys())
+                    
+                    # Get the newest maturity (first in list since descending order)
+                    newest_maturity = sorted_maturities[0]
+                    
+                    # Initialize or update selected maturity in session state
+                    # Check if bond changed or if selected_maturity not set
+                    if 'selected_maturity' not in st.session_state or \
+                       'last_selected_bond' not in st.session_state or \
+                       st.session_state.last_selected_bond != selected_bond:
+                        st.session_state.selected_maturity = newest_maturity
+                        st.session_state.last_selected_bond = selected_bond
+                    
+                    # If currently selected maturity is not in the available maturities, reset to newest
+                    if st.session_state.selected_maturity not in sorted_maturities:
+                        st.session_state.selected_maturity = newest_maturity
+                    
+                    # Create columns for buttons (max 6 per row)
+                    n_cols = min(6, len(sorted_maturities))
+                    cols = st.columns(n_cols)
+                    
+                    # Create buttons
+                    for idx, maturity in enumerate(sorted_maturities):
+                        col_idx = idx % n_cols
+                        with cols[col_idx]:
+                            if st.button(
+                                str(maturity.year), 
+                                use_container_width=True,
+                                key=f"btn_maturity_{maturity}"
+                            ):
+                                st.session_state.selected_maturity = maturity
+                    
+                    # Display chart for selected maturity
+                    selected_maturity = st.session_state.selected_maturity
+                    
+                    if selected_maturity in all_time_series:
+                        time_series = all_time_series[selected_maturity]
+                        fig_ts = create_maturity_time_series_chart(time_series, selected_maturity, selected_bond)
+                        st.plotly_chart(fig_ts, use_container_width=True)
+                        
+                        # Display some statistics
+                        col1, col2, col3, col4, col5 = st.columns(5)
+                        with col1:
+                            st.metric("Taxa Atual", f"{time_series.iloc[-1]:.2f}%")
+                        with col2:
+                            st.metric("Taxa Média", f"{time_series.mean():.2f}%")
+                        with col3:
+                            st.metric("Taxa Máxima", f"{time_series.max():.2f}%")
+                        with col4:
+                            st.metric("Taxa Mínima", f"{time_series.min():.2f}%")
+                        with col5:
+                            st.metric("Desvio Padrão", f"{time_series.std():.2f}%")
+                else:
+                    st.warning("Não há dados de séries históricas disponíveis.")
                 
                 # 2. Calculate and display rate variations
                 st.markdown("### 📉 Variações de Taxa")
