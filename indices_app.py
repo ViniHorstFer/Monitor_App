@@ -13,8 +13,18 @@ import yfinance as yf
 import calendar
 import time
 import os
+from bs4 import BeautifulSoup
+import trafilatura
+from groq import Groq
 
 warnings.filterwarnings('ignore')
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GROQ API KEY CONFIGURATION - ADD YOUR KEY HERE
+# ═══════════════════════════════════════════════════════════════════════════════
+# Get your FREE API key from: https://console.groq.com
+GROQ_API_KEY = "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"  # <-- EDIT THIS LINE
+# ═══════════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIGURATION
@@ -885,11 +895,360 @@ def show_landing_page():
 # MAIN DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEWS AGGREGATOR FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NewsletterAggregator:
+    def __init__(self, api_key=None):
+        self.today = datetime.now().strftime("%Y-%m-%d")
+        self.yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # Initialize Groq client with priority: passed key > GROQ_API_KEY constant
+        if not api_key:
+            api_key = GROQ_API_KEY if GROQ_API_KEY != "your_groq_api_key_here" else None
+        
+        if api_key:
+            self.client = Groq(api_key=api_key)
+            self.use_ai = True
+        else:
+            self.client = None
+            self.use_ai = False
+    
+    def fetch_content(self, url, timeout=15):
+        """Fetch content from URL with error handling"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            }
+            response = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            response.raise_for_status()
+            return response.text
+        except:
+            return None
+    
+    def extract_text(self, html_content):
+        """Extract clean text from HTML using trafilatura"""
+        try:
+            text = trafilatura.extract(html_content, include_comments=False, 
+                                      include_tables=True, no_fallback=False)
+            if text:
+                return text
+            soup = BeautifulSoup(html_content, 'html.parser')
+            return soup.get_text(separator='\n', strip=True)
+        except:
+            return None
+    
+    def extract_wsj_section(self, html_content, section_start, stop_phrase=None):
+        """Extract specific sections from WSJ newsletters with precise stop phrases"""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            text = soup.get_text(separator='\n', strip=True)
+            
+            if section_start:
+                start_idx = text.lower().find(section_start.lower())
+                if start_idx == -1:
+                    start_idx = 0
+            else:
+                start_idx = 0
+            
+            if stop_phrase:
+                stop_idx = text.lower().find(stop_phrase.lower(), start_idx)
+                if stop_idx != -1:
+                    return text[start_idx:stop_idx].strip()
+            
+            # Increased from 3000 to 5000 to capture more content for What's News
+            return text[start_idx:start_idx+5000].strip()
+        except:
+            return None
+    
+    def clean_text(self, text):
+        """Basic text cleaning without AI"""
+        text = ' '.join(text.split())
+        if len(text) > 2000:
+            text = text[:2000] + "..."
+        return text
+    
+    def summarize_with_groq(self, content, source_name, is_morning=True):
+        """Use Groq to create a refined, comprehensive summary in Portuguese"""
+        if not content:
+            return None
+        
+        if not self.use_ai:
+            return self.clean_text(content)
+        
+        # Determine newsletter-specific instructions
+        if "What's News" in source_name:
+            # WSJ What's News has a specific enumerated structure
+            specific_instructions = """
+ESTRUTURA ESPECÍFICA PARA WSJ WHAT'S NEWS:
+- Esta newsletter apresenta EXATAMENTE 5 tópicos principais do dia
+- Máximo 1000 caracteres no total
+- Cada tópico é numerado de 1 a 5
+- PRESERVE a numeração original e estrutura
+- Para cada tópico numerado:
+  * Inicie com o número (1., 2., 3., 4., 5.)
+  * Resuma o tema principal em 1-2 frases concisas em português
+  * Mantenha dados numéricos e nomes específicos
+  * Não misture informações de diferentes tópicos
+
+FORMATO DE SAÍDA OBRIGATÓRIO:
+1. [Resumo conciso do primeiro tópico em português]
+
+2. [Resumo conciso do segundo tópico em português]
+
+3. [Resumo conciso do terceiro tópico em português]
+
+4. [Resumo conciso do quarto tópico em português]
+
+5. [Resumo conciso do quinto tópico em português]"""
+            max_tokens = 1000
+            temperature = 0.2  # Lower for better structure preservation
+            
+        elif "Markets AM" in source_name:
+            # WSJ Markets AM is more narrative
+            specific_instructions = """
+ESTRUTURA ESPECÍFICA PARA WSJ MARKETS AM:
+- Organize em parágrafos curtos por tema
+- Máximo 1000 caracteres no total
+- Primeira parte: principais movimentos de pré-mercado e expectativas
+- Segunda parte: dados econômicos e eventos do dia
+- Terceira parte: destaques corporativos relevantes
+- Use linguagem direta e objetiva
+- Mantenha todos os números e percentuais exatos"""
+            max_tokens = 800
+            temperature = 0.3
+            
+        elif "Markets PM" in source_name:
+            # WSJ Markets PM focuses on closing data
+            specific_instructions = """
+ESTRUTURA ESPECÍFICA PARA WSJ MARKETS PM:
+- Comece com os fechamentos dos principais índices (S&P, Dow, Nasdaq)
+- Máximo 1000 caracteres no total
+- Inclua percentuais exatos de variação
+- Mencione setores que se destacaram
+- Principais movimentos de títulos do tesouro e commodities
+- Notícias corporativas relevantes do dia
+- Use formato de parágrafos curtos e diretos"""
+            max_tokens = 800
+            temperature = 0.3
+        else:
+            specific_instructions = """
+INSTRUÇÕES GERAIS:
+- Organize em parágrafos curtos e claros
+- Use lista numerada se houver múltiplos tópicos distintos
+- Mantenha estrutura lógica por tema"""
+            max_tokens = 800
+            temperature = 0.3
+        
+        time_context = "briefing matinal para o pregão de hoje" if is_morning else "resumo pós-mercado do pregão de hoje"
+        
+        prompt = f"""Você é um tradutor e analista financeiro especializado em resumir newsletters de mercado mantendo FIDELIDADE TOTAL à estrutura original.
+
+FONTE: {source_name}
+CONTEXTO: {time_context}
+
+CONTEÚDO ORIGINAL EM INGLÊS:
+{content[:5000]}
+
+{specific_instructions}
+
+REGRAS CRÍTICAS DE TRADUÇÃO E FORMATAÇÃO:
+1. Traduza TODO o conteúdo para PORTUGUÊS BRASILEIRO de forma natural e fluente
+2. NUNCA deixe frases ou palavras em inglês no resultado final
+3. Mantenha TODOS os números, percentuais e dados específicos EXATAMENTE como no original
+4. Preserve nomes próprios de empresas, índices e pessoas sem tradução
+5. Use terminologia financeira profissional em português (ex: "ações", "títulos", "rendimentos")
+6. Seja CONCISO mas COMPLETO - capture todas as informações essenciais
+7. Remova completamente: rodapés, prompts de assinatura, CTAs, links de newsletter
+8. Se houver enumeração no original, PRESERVE a estrutura numérica
+
+QUALIDADE DA TRADUÇÃO:
+- Priorize naturalidade e fluidez em português brasileiro
+- Evite traduções literais que soem artificiais
+- Use construções de frase idiomáticas do português
+- Contexto de mercado financeiro brasileiro
+
+Responda APENAS com o resumo traduzido e formatado, sem introduções ou comentários adicionais."""
+
+        try:
+            chat_completion = self.client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Você é um tradutor financeiro especializado que cria resumos precisos, bem estruturados e em português brasileiro fluente, mantendo fidelidade total à estrutura original do conteúdo."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                model="llama-3.3-70b-versatile",
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=0.95,
+                stream=False
+            )
+            return chat_completion.choices[0].message.content.strip()
+        except Exception as e:
+            return self.clean_text(content)
+    
+    def fetch_wsj_markets_am(self):
+        """Fetch WSJ Markets AM"""
+        url = "https://marketsam.createsend1.com/t/d-e-strdydt-l-r/"
+        html = self.fetch_content(url)
+        
+        if html:
+            text = self.extract_wsj_section(html, "", "Stocks I'm Watching")
+            if text:
+                summary = self.summarize_with_groq(text, "WSJ Markets AM", is_morning=True)
+                return {
+                    'source': 'WSJ Markets AM',
+                    'timestamp': self.today,
+                    'type': 'Newsletter Matinal',
+                    'content': summary,
+                    'status': 'success'
+                }
+        
+        return {
+            'source': 'WSJ Markets AM',
+            'timestamp': self.today,
+            'type': 'Newsletter Matinal',
+            'content': None,
+            'status': 'error',
+            'error': 'Falha ao buscar ou processar conteúdo'
+        }
+    
+    def fetch_wsj_whats_news(self):
+        """Fetch WSJ What's News"""
+        url = "https://whatsnews.createsend1.com/t/d-e-ekhlrg-l-r/"
+        html = self.fetch_content(url)
+        
+        if html:
+            # Extract the main content section more precisely
+            text = self.extract_wsj_section(html, "What to Watch Today", "Enjoying this newsletter?")
+            
+            # If the primary extraction didn't work, try alternative markers
+            if not text or len(text) < 200:
+                text = self.extract_wsj_section(html, "What to Watch", "Enjoying this newsletter?")
+            
+            # Additional fallback
+            if not text or len(text) < 200:
+                text = self.extract_wsj_section(html, "", "Enjoying this newsletter?")
+            
+            if text:
+                summary = self.summarize_with_groq(text, "WSJ What's News", is_morning=True)
+                return {
+                    'source': "WSJ What's News",
+                    'timestamp': self.today,
+                    'type': 'Newsletter Matinal',
+                    'content': summary,
+                    'status': 'success'
+                }
+        
+        return {
+            'source': "WSJ What's News",
+            'timestamp': self.today,
+            'type': 'Newsletter Matinal',
+            'content': None,
+            'status': 'error',
+            'error': 'Falha ao buscar ou processar conteúdo'
+        }
+    
+    def fetch_wsj_markets_pm(self):
+        """Fetch WSJ Markets PM"""
+        url = "https://marketspm.createsend1.com/t/d-e-styltdt-l-r/"
+        html = self.fetch_content(url)
+        
+        if html:
+            text = self.extract_wsj_section(html, "What Happened in Markets Today", "CONTENT FROM:")
+            if text:
+                summary = self.summarize_with_groq(text, "WSJ Markets PM", is_morning=False)
+                return {
+                    'source': 'WSJ Markets PM',
+                    'timestamp': self.yesterday,
+                    'type': 'Newsletter Pós-Mercado',
+                    'content': summary,
+                    'status': 'success'
+                }
+        
+        return {
+            'source': 'WSJ Markets PM',
+            'timestamp': self.yesterday,
+            'type': 'Newsletter Pós-Mercado',
+            'content': None,
+            'status': 'error',
+            'error': 'Falha ao buscar ou processar conteúdo'
+        }
+    
+    def fetch_all_newsletters(self):
+        """Fetch all newsletters"""
+        newsletters = {
+            'wsj_markets_am': self.fetch_wsj_markets_am(),
+            'wsj_whats_news': self.fetch_wsj_whats_news(),
+            'wsj_markets_pm': self.fetch_wsj_markets_pm()
+        }
+        return newsletters
+
+def display_newsletter_card(newsletter_data):
+    """Display a newsletter in a card format using Streamlit containers"""
+    
+    with st.container():
+        # Status badge
+        if newsletter_data['status'] == 'success':
+            st.markdown('<div style="background-color: #1a4d2e; color: #4ade80; padding: 4px 12px; border-radius: 12px; font-size: 11px; font-weight: 600; display: inline-block; margin-bottom: 10px;">✓ CARREGADO</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="background-color: #4d1a1a; color: #f87171; padding: 4px 12px; border-radius: 12px; font-size: 11px; font-weight: 600; display: inline-block; margin-bottom: 10px;">✗ ERRO</div>', unsafe_allow_html=True)
+        
+        # Source header
+        st.markdown(f'<div style="color: #d4af37; font-size: 24px; font-weight: 700; margin-bottom: 8px; font-family: \'Helvetica Neue\', sans-serif; letter-spacing: 0.5px;">{newsletter_data["source"]}</div>', unsafe_allow_html=True)
+        
+        # Timestamp
+        st.markdown(f'<div style="color: #888; font-size: 12px; margin-bottom: 15px; font-style: italic;">{newsletter_data["type"]} • {newsletter_data["timestamp"]}</div>', unsafe_allow_html=True)
+        
+        # Content
+        if newsletter_data['status'] == 'success' and newsletter_data['content']:
+            st.markdown(
+                f"""
+                <div style="
+                    color: white;
+                    font-size: 16px;
+                    line-height: 1.7;
+                    text-align: justify;
+                    margin-top: 10px;
+                ">
+                {newsletter_data['content']}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                '<div style="color: #ff6b6b; font-size: 16px; margin-top: 10px;">'
+                f"⚠️ {newsletter_data.get('error', 'Conteúdo indisponível')}"
+                '</div>',
+                unsafe_allow_html=True
+            )
+        
+        # Divider
+        st.markdown("<div style='border-top: 1px solid #333; margin: 30px 0;'></div>", unsafe_allow_html=True)
+
+# Initialize newsletter session state
+if 'newsletters_data' not in st.session_state:
+    st.session_state.newsletters_data = {}
+if 'last_news_refresh' not in st.session_state:
+    st.session_state.last_news_refresh = None
+
 def show_dashboard():
     st.title("📈 Painel de Índices de Mercado")
     
     # Create tabs
-    tab1, tab3 = st.tabs(["Análise de Índices", "Tesouro Direto"])
+    tab1, tab2, tab3 = st.tabs(["Análise de Índices", "Tesouro Direto", "Notícias de Mercado"])
     
     # ═══════════════════════════════════════════════════════════════════════════
     # TAB 1: ANÁLISE DE ÍNDICES
@@ -1223,10 +1582,10 @@ def show_dashboard():
         )
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # TAB 3: TESOURO DIRETO
+    # TAB 2: TESOURO DIRETO
     # ═══════════════════════════════════════════════════════════════════════════
     
-    with tab3:
+    with tab2:
         st.header("💰 Análise de Taxas do Tesouro Direto")
         
         # Load Tesouro Direto data
@@ -1495,6 +1854,92 @@ def show_dashboard():
         else:
             st.error("Não foi possível carregar os dados do Tesouro Direto. Verifique sua conexão.")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TAB 3: NOTÍCIAS DE MERCADO (NEWS AGGREGATOR)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    with tab3:
+        st.header("📰 Agregador de Notícias Financeiras")
+        
+        # Check if API key is configured
+        api_key_configured = GROQ_API_KEY != "your_groq_api_key_here"
+        
+        if not api_key_configured:
+            st.error("⚠️ Por favor configure a chave API Groq no código!")
+            st.info("Obtenha sua chave API GRATUITA em: https://console.groq.com")
+            st.markdown("""
+            **Como configurar:**
+            1. Edite o arquivo Python
+            2. Procure por `GROQ_API_KEY = "your_groq_api_key_here"`
+            3. Substitua pela sua chave (começa com `gsk_`)
+            4. Salve e reinicie o app
+            """)
+        else:
+            # Control panel
+            col1, col2, col3 = st.columns([2, 2, 1])
+            
+            with col1:
+                if st.button("🔄 Atualizar Notícias", use_container_width=True, key="news_refresh"):
+                    with st.spinner("Buscando e processando newsletters..."):
+                        aggregator = NewsletterAggregator()
+                        st.session_state.newsletters_data = aggregator.fetch_all_newsletters()
+                        st.session_state.last_news_refresh = datetime.now()
+                        st.success("✅ Notícias atualizadas!")
+                        st.rerun()
+            
+            with col2:
+                if st.session_state.last_news_refresh:
+                    st.info(f"Última atualização: {st.session_state.last_news_refresh.strftime('%H:%M:%S')}")
+                else:
+                    st.info("Clique em 'Atualizar Notícias' para carregar")
+            
+            st.markdown("---")
+            
+            # Load newsletters on first access if not already loaded
+            if not st.session_state.newsletters_data:
+                with st.spinner("Carregando newsletters pela primeira vez..."):
+                    aggregator = NewsletterAggregator()
+                    st.session_state.newsletters_data = aggregator.fetch_all_newsletters()
+                    st.session_state.last_news_refresh = datetime.now()
+            
+            # Display newsletters
+            newsletters = st.session_state.newsletters_data
+            
+            if newsletters:
+                # Morning Section
+                st.markdown("### 🌅 Relatórios Matinais")
+                st.markdown("*Análise pré-mercado e perspectivas para hoje*")
+                
+                morning_newsletters = [
+                    newsletters.get('wsj_markets_am'),
+                    newsletters.get('wsj_whats_news')
+                ]
+                
+                for newsletter in morning_newsletters:
+                    if newsletter:
+                        display_newsletter_card(newsletter)
+                
+                # After-market Section
+                st.markdown("---")
+                st.markdown("### 🌆 Relatórios Pós-Mercado")
+                st.markdown("*Resumo do fechamento e análise*")
+                
+                afternoon_newsletters = [
+                    newsletters.get('wsj_markets_pm')
+                ]
+                
+                for newsletter in afternoon_newsletters:
+                    if newsletter:
+                        display_newsletter_card(newsletter)
+                
+                st.markdown("---")
+                st.markdown(
+                    "<p style='text-align: center; color: #d4af37; font-family: Montserrat;'>Powered by Groq (Llama 3.3 70B) | Fonte: Wall Street Journal</p>",
+                    unsafe_allow_html=True
+                )
+            else:
+                st.warning("Clique em 'Atualizar Notícias' para carregar as newsletters.")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN APP LOGIC
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1503,4 +1948,3 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
-
