@@ -23,7 +23,16 @@ warnings.filterwarnings('ignore')
 # GROQ API KEY CONFIGURATION - ADD YOUR KEY HERE
 # ═══════════════════════════════════════════════════════════════════════════════
 # Get your FREE API key from: https://console.groq.com
-GROQ_API_KEY = "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"  # <-- EDIT THIS LINE
+# Load Groq API key securely
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except FileNotFoundError:
+    # Local development fallback (you will set this in .streamlit/secrets.toml)
+    st.error("⚠️ Groq API key not found. Add it to .streamlit/secrets.toml for local testing.")
+    GROQ_API_KEY = None
+except KeyError:
+    st.error("⚠️ 'GROQ_API_KEY' not found in secrets. Configure it in Streamlit Cloud settings.")
+    GROQ_API_KEY = None
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1948,3 +1957,4 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
