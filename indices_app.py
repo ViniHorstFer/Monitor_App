@@ -4129,7 +4129,6 @@ def show_dashboard():
                 available_dates = sample_df.columns[1:].tolist() if sample_df is not None else []
                 
                 # Create 4 main buttons
-                st.markdown("### Visualização de Dados")
                 col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
@@ -4735,4 +4734,5 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
 
