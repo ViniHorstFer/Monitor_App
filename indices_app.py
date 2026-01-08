@@ -968,8 +968,9 @@ def init_supabase_client():
     if not SUPABASE_AVAILABLE:
         return None
     
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_KEY")
+    # Use the variables loaded from st.secrets at the top of the file
+    supabase_url = SUPABASE_URL
+    supabase_key = SUPABASE_KEY
     
     if not supabase_url or not supabase_key:
         st.warning("⚠️ Supabase credentials not found. Database features disabled.")
@@ -2244,7 +2245,7 @@ def display_noticiario_renda_fixa(daily_reports):
             if report['sections']['mercado_domestico']['items']:
                 st.markdown(f"""
                     <div class="section-box">
-                        <div class="section-title">📍 {report['sections']['mercado_domestico']['title']}</div>
+                        <div class="section-title">🇧🇷 {report['sections']['mercado_domestico']['title']}</div>
                 """, unsafe_allow_html=True)
                 
                 for item in report['sections']['mercado_domestico']['items']:
