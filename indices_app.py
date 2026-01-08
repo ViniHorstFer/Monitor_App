@@ -909,9 +909,11 @@ def show_landing_page():
     
     with col2:
         st.markdown('<div class="login-container">', unsafe_allow_html=True)
+        st.markdown('<p class="login-title">INDICES ANALYTICS</p>', unsafe_allow_html=True)
+        st.markdown('<p style="color: #888888; text-align: center; margin-bottom: 20px;">Please sign in to continue</p>', unsafe_allow_html=True)
         
-        username_input = st.text_input("Usuário", key="login_username_input", placeholder="Digite seu usuário")
-        password_input = st.text_input("Senha", type="password", key="login_password_input", placeholder="Digite sua senha")
+        username_input = st.text_input(key="login_username_input", placeholder="Digite seu usuário")
+        password_input = st.text_input(type="password", key="login_password_input", placeholder="Digite sua senha")
         
         col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
         with col_btn2:
@@ -4733,6 +4735,7 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
 
 
 
