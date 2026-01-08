@@ -2245,7 +2245,7 @@ def display_noticiario_renda_fixa(daily_reports):
             if report['sections']['mercado_domestico']['items']:
                 st.markdown(f"""
                     <div class="section-box">
-                        <div class="section-title">🇧🇷 {report['sections']['mercado_domestico']['title']}</div>
+                        <div class="section-title">📍 {report['sections']['mercado_domestico']['title']}</div>
                 """, unsafe_allow_html=True)
                 
                 for item in report['sections']['mercado_domestico']['items']:
@@ -4722,7 +4722,7 @@ def show_dashboard():
                 4. Cada dia terá as seguintes seções:
                    - 📊 **Leitura da Curva**: Análise dos juros futuros
                    - 🌍 **Mercados Globais**: Notícias internacionais
-                   - 🇧🇷 **Mercado Doméstico**: Notícias do Brasil
+                   - 📍 **Mercado Doméstico**: Notícias do Brasil
                    - 📰 **Noticiário Corporativo**: Notícias por setor
                 """)
     
@@ -4734,5 +4734,6 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
 
 
