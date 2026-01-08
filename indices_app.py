@@ -966,11 +966,15 @@ except ImportError:
 def init_supabase_client():
     """Initialize Supabase client (optional)"""
     if not SUPABASE_AVAILABLE:
+        st.error("❌ DEBUG: Supabase library not available (import failed)")
         return None
     
     # Use the variables loaded from st.secrets at the top of the file
     supabase_url = SUPABASE_URL
     supabase_key = SUPABASE_KEY
+    
+    st.info(f"🔍 DEBUG: SUPABASE_URL = {supabase_url[:30] + '...' if supabase_url else 'None'}")
+    st.info(f"🔍 DEBUG: SUPABASE_KEY = {'***' + supabase_key[-10:] if supabase_key else 'None'}")
     
     if not supabase_url or not supabase_key:
         st.warning("⚠️ Supabase credentials not found. Database features disabled.")
@@ -978,9 +982,12 @@ def init_supabase_client():
     
     try:
         client = create_client(supabase_url, supabase_key)
+        st.success("✅ DEBUG: Supabase client created successfully!")
         return client
     except Exception as e:
-        st.warning(f"⚠️ Could not connect to Supabase: {e}")
+        st.error(f"❌ DEBUG: Could not connect to Supabase: {e}")
+        import traceback
+        st.error(traceback.format_exc())
         return None
 
 
