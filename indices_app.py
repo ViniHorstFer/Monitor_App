@@ -9,6 +9,7 @@ from dateutil.relativedelta import relativedelta
 import requests
 from io import BytesIO, StringIO
 import warnings
+import hashlib
 import yfinance as yf
 import calendar
 import time
@@ -16,8 +17,26 @@ import os
 from bs4 import BeautifulSoup
 import trafilatura
 from groq import Groq
+import email
+from email import policy
+from email.parser import BytesParser
+import json
+import re
 
 warnings.filterwarnings('ignore')
+
+
+def generate_blue_gradient(n):
+    """Generate n shades of blue from light (oldest) to dark (newest)"""
+    import colorsys
+    colors = []
+    for i in range(n):
+        # HSL: H=210 (blue), S=100%, L varies from 70% (light) to 20% (dark)
+        lightness = 70 - (50 * i / (n - 1)) if n > 1 else 70
+        r, g, b = colorsys.hls_to_rgb(210/360, lightness/100, 1.0)
+        hex_color = f'#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}'
+        colors.append(hex_color)
+    return colors
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GROQ API KEY CONFIGURATION - ADD YOUR KEY HERE
@@ -33,6 +52,18 @@ except FileNotFoundError:
 except KeyError:
     st.error("⚠️ 'GROQ_API_KEY' not found in secrets. Configure it in Streamlit Cloud settings.")
     GROQ_API_KEY = None
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUPABASE CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+# Load Supabase credentials from secrets
+try:
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+except:
+    SUPABASE_URL = None
+    SUPABASE_KEY = None
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -908,162 +939,2354 @@ def show_landing_page():
 # NEWS AGGREGATOR FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class NewsletterAggregator:
-    def __init__(self, api_key=None):
-        self.today = datetime.now().strftime("%Y-%m-%d")
-        self.yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+# NEWSLETTER PROCESSING FUNCTIONS (from news_v5.py)
+def init_groq_client():
+    """Initialize Groq client"""
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    
+    if not groq_api_key:
+        st.error("🔑 GROQ_API_KEY not found in environment variables")
+        st.info("Please set your Groq API key in .streamlit/secrets.toml or environment variables")
+        return None
+    
+    try:
+        client = Groq(api_key=groq_api_key)
+        return client
+    except Exception as e:
+        st.error(f"Error initializing Groq client: {e}")
+        return None
+
+# Try to import Supabase (optional)
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+
+def init_supabase_client():
+    """Initialize Supabase client (optional)"""
+    if not SUPABASE_AVAILABLE:
+        return None
+    
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+    
+    if not supabase_url or not supabase_key:
+        st.warning("⚠️ Supabase credentials not found. Database features disabled.")
+        return None
+    
+    try:
+        client = create_client(supabase_url, supabase_key)
+        return client
+    except Exception as e:
+        st.warning(f"⚠️ Could not connect to Supabase: {e}")
+        return None
+
+
+def parse_eml_file(uploaded_file):
+    """Parse .eml file and extract content"""
+    try:
+        # Read the uploaded file
+        raw_email = uploaded_file.read()
         
-        # Initialize Groq client with priority: passed key > GROQ_API_KEY constant
-        if not api_key:
-            api_key = GROQ_API_KEY if GROQ_API_KEY != "your_groq_api_key_here" else None
+        # Parse email
+        msg = BytesParser(policy=policy.default).parsebytes(raw_email)
         
-        if api_key:
-            self.client = Groq(api_key=api_key)
-            self.use_ai = True
+        # Extract metadata
+        subject = msg.get('subject', 'No Subject')
+        sender = msg.get('from', 'Unknown')
+        recipient = msg.get('to', 'Unknown')
+        date = msg.get('date', 'Unknown')
+        
+        # Extract HTML content
+        html_content = None
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == 'text/html':
+                    html_content = part.get_content()
+                    break
         else:
-            self.client = None
-            self.use_ai = False
-    
-    def fetch_content(self, url, timeout=15):
-        """Fetch content from URL with error handling"""
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            }
-            response = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-            response.raise_for_status()
-            return response.text
-        except:
+            if msg.get_content_type() == 'text/html':
+                html_content = msg.get_content()
+        
+        if not html_content:
             return None
+        
+        return {
+            'subject': subject,
+            'sender': sender,
+            'recipient': recipient,
+            'date': date,
+            'html': html_content
+        }
+        
+    except Exception as e:
+        st.error(f"Error parsing email: {e}")
+        return None
+
+
+def clean_html_for_extraction(html_content):
+    """Clean and reduce HTML size"""
+    from bs4 import BeautifulSoup
     
-    def extract_text(self, html_content):
-        """Extract clean text from HTML using trafilatura"""
-        try:
-            text = trafilatura.extract(html_content, include_comments=False, 
-                                      include_tables=True, no_fallback=False)
-            if text:
-                return text
-            soup = BeautifulSoup(html_content, 'html.parser')
-            return soup.get_text(separator='\n', strip=True)
-        except:
-            return None
+    soup = BeautifulSoup(html_content, 'html.parser')
     
-    def extract_wsj_section(self, html_content, section_start, stop_phrase=None):
-        """Extract specific sections from WSJ newsletters with precise stop phrases"""
-        try:
-            soup = BeautifulSoup(html_content, 'html.parser')
-            text = soup.get_text(separator='\n', strip=True)
-            
-            if section_start:
-                start_idx = text.lower().find(section_start.lower())
-                if start_idx == -1:
-                    start_idx = 0
-            else:
-                start_idx = 0
-            
-            if stop_phrase:
-                stop_idx = text.lower().find(stop_phrase.lower(), start_idx)
-                if stop_idx != -1:
-                    return text[start_idx:stop_idx].strip()
-            
-            # Increased from 3000 to 5000 to capture more content for What's News
-            return text[start_idx:start_idx+5000].strip()
-        except:
-            return None
+    # Remove script and style tags
+    for tag in soup(['script', 'style', 'meta', 'link', 'head']):
+        tag.decompose()
     
-    def clean_text(self, text):
-        """Basic text cleaning without AI"""
-        text = ' '.join(text.split())
-        if len(text) > 2000:
-            text = text[:2000] + "..."
+    # Remove images (keep alt text if any)
+    for img in soup.find_all('img'):
+        alt_text = img.get('alt', '')
+        if alt_text:
+            img.replace_with(f"[IMAGE: {alt_text}]")
+        else:
+            img.decompose()
+    
+    # Get clean HTML
+    clean_html = str(soup)
+    
+    return clean_html
+
+
+
+def create_smart_summary(groq_client, text, max_chars=250, title=None):
+    """Create AI-powered smart summary - NO ellipsis, NO redundancy with title"""
+    if len(text) <= max_chars:
         return text
     
-    def summarize_with_groq(self, content, source_name, is_morning=True):
-        """Use Groq to create a refined, comprehensive summary in Portuguese"""
-        if not content:
+    try:
+        # Prompt AI to create non-redundant summary
+        if title:
+            prompt = f"""Resuma este texto em EXATAMENTE {max_chars} caracteres ou menos.
+
+TÍTULO: {title}
+
+TEXTO: {text}
+
+Instruções CRÍTICAS:
+- Máximo de {max_chars} caracteres
+- NÃO repita palavras ou conceitos do TÍTULO
+- Foque em detalhes, contexto e informações COMPLEMENTARES ao título
+- Se o título diz "Fed corta juros", o resumo deve focar em IMPACTOS, RAZÕES, DETALHES - nunca repita "Fed cortou juros"
+- NÃO termine com "..."
+- Frase completa e natural
+- Em português
+
+Resumo:"""
+        else:
+            prompt = f"""Resuma este texto em EXATAMENTE {max_chars} caracteres ou menos.
+
+Texto: {text}
+
+Instruções:
+- Máximo de {max_chars} caracteres
+- NÃO termine com "..."
+- Frase completa e natural
+- Em português
+
+Resumo:"""
+        
+        response = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=200
+        )
+        
+        summary = response.choices[0].message.content.strip()
+        
+        # Clean up response
+        summary = summary.replace('"', '').replace("'", '').replace('Resumo:', '').strip()
+        
+        # Remove trailing ellipsis if AI added it
+        if summary.endswith('...'):
+            summary = summary[:-3].strip()
+        
+        # If still too long, truncate at word boundary
+        if len(summary) > max_chars:
+            summary = summary[:max_chars]
+            last_space = summary.rfind(' ')
+            if last_space > max_chars * 0.8:
+                summary = summary[:last_space]
+        
+        return summary.strip()
+        
+    except Exception as e:
+        # Fallback: smart truncation
+        if len(text) <= max_chars:
+            return text
+        truncated = text[:max_chars]
+        last_space = truncated.rfind(' ')
+        if last_space > max_chars * 0.8:
+            return truncated[:last_space].strip()
+        return truncated.strip()
+
+
+
+
+def extract_investnews(groq_client, html_content):
+    """Extract InvestNews newsletter content"""
+    
+    # Clean HTML
+    cleaned_content = clean_html_for_extraction(html_content)
+    
+    # Limit content size
+    char_limit = 50000
+    if len(cleaned_content) > char_limit:
+        cleaned_content = cleaned_content[:char_limit]
+    
+    # Extraction prompt
+    extraction_prompt = """Você é um especialista em análise de newsletters do InvestNews.
+
+🎯 OBJETIVO: Extrair e resumir as 4 seções principais da newsletter de forma concisa.
+
+📝 ESTRUTURA DA NEWSLETTER:
+1. MATÉRIA PRINCIPAL - A primeira grande notícia do dia
+2. DESTAQUES - 3 notícias curtas em bullets
+3. SEGUNDA MATÉRIA - Segunda história importante, sempre aparece DEPOIS dos destaques ou "UMA IMAGEM"
+4. VALE PARAR PARA LER - Recomendações de leitura (sempre 2 itens)
+
+🔍 REGRAS DE RESUMO (IMPORTANTE):
+- MATÉRIA PRINCIPAL: Extraia o texto completo OU resuma em até 500 caracteres (o que for mais conciso)
+- Cada DESTAQUE: Extraia o texto completo OU resuma em até 250 caracteres (o que for mais conciso)
+- SEGUNDA MATÉRIA: Extraia o texto completo OU resuma em até 500 caracteres (o que for mais conciso)
+- Cada VALE PARAR: Extraia o texto completo OU resuma em até 250 caracteres (o que for mais conciso)
+
+🔗 EXTRAÇÃO DE LINKS (MUITO IMPORTANTE):
+- MATÉRIA PRINCIPAL: Procure por "Leia mais nesta reportagem" - capture o URL completo (https://...) que aparece próximo
+- DESTAQUES: Cada destaque tem um link - procure por URLs (https://...) no texto ou próximo ao título
+- SEGUNDA MATÉRIA: Procure por "Leia mais nesta reportagem do Wall Street Journal" - capture o URL
+- VALE PARAR PARA LER: Cada item tem um link - capture URLs completos
+
+📋 FORMATO JSON:
+{
+  "main_story": {"title": "...", "content": "≤500 chars", "url": "https://..."},
+  "highlights": [
+    {"title": "...", "content": "≤250 chars", "url": "https://..."},
+    {"title": "...", "content": "≤250 chars", "url": "https://..."},
+    {"title": "...", "content": "≤250 chars", "url": "https://..."}
+  ],
+  "segunda_materia": {"title": "...", "content": "≤500 chars", "url": "https://..."} ou null,
+  "vale_parar_para_ler": [
+    {"title": "...", "content": "≤250 chars", "url": "https://..."},
+    {"title": "...", "content": "≤250 chars", "url": "https://..."}
+  ]
+}
+
+⚠️ IMPORTANTE: Se não encontrar URL para algum item, use null para o campo "url".
+
+Retorne APENAS JSON (sem ``` ou markdown):"""
+    
+    try:
+        messages = [
+            {
+                "role": "user",
+                "content": f"{extraction_prompt}\n\nCONTEÚDO:\n{cleaned_content}"
+            }
+        ]
+        
+        response = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=messages,
+            temperature=0.05,
+            max_tokens=8192,
+            top_p=0.9
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Extract JSON
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+        
+        sections = json.loads(response_text)
+        return sections
+        
+    except Exception as e:
+        st.error(f"Error in Groq extraction: {e}")
+        return None
+
+
+def extract_exame(groq_client, html_content):
+    """Extract Exame newsletter content"""
+    
+    cleaned_content = clean_html_for_extraction(html_content)
+    
+    char_limit = 40000
+    if len(cleaned_content) > char_limit:
+        cleaned_content = cleaned_content[:char_limit]
+    
+    extraction_prompt = """Você é um especialista em análise de newsletters da Exame.
+
+🎯 OBJETIVO: Extrair TODAS as manchetes (headlines) da newsletter com seus conteúdos e links.
+
+📝 ESTRUTURA DA NEWSLETTER EXAME:
+- Começa com "VOCÊ VÊ NA DESPERTA:" (preview das notícias)
+- Depois vem as manchetes elaboradas (tipicamente 5-7 manchetes)
+- PRIMEIRA manchete: font-size 26px (maior)
+- DEMAIS manchetes: font-size 20px
+- Cada manchete tem conteúdo explicativo completo
+- Cada manchete tem um link "SAIBA MAIS" ou link direto
+
+🔍 CRITÉRIOS DE IDENTIFICAÇÃO:
+**Como identificar uma manchete:**
+1. Texto com fonte 26px OU 20px
+2. Comprimento entre 20-200 caracteres
+3. Parece ser um título de notícia
+4. Seguido de conteúdo explicativo
+5. Tem um link associado (geralmente click.comunicacao-exame.com)
+
+**Exemplos de manchetes desta newsletter:**
+- "O que muda no Imposto de Renda"
+- "Moraes determina que Bolsonaro cumpra pena na Superintendência da PF"
+- "Google volta ao topo: a gigante que hesitou na IA está rumo aos US$ 4 trilhões"
+- "EUA despenca e Brasil sobe em ranking global de atração de talentos"
+- "SoftBank perde R$ 549 bilhões após aposta pesada na OpenAI"
+- "Restaurante de Belém deve faturar R$ 40 milhões — sem aumentar preços na COP30"
+- "As apostas do YouTube para tomar a dianteira na corrida do streaming"
+
+🚨 ATENÇÃO: Esta newsletter tem PELO MENOS 5-7 MANCHETES. Você DEVE encontrar TODAS elas!
+
+🔍 ESTRATÉGIA DE EXTRAÇÃO:
+1. Procure por TODOS os textos com font-size 26px ou 20px
+2. Para cada manchete encontrada:
+   - Título: texto da manchete
+   - Conteúdo: parágrafo(s) explicativo(s) que vem logo após a manchete
+   - URL: link "click.comunicacao-exame.com" mais próximo da manchete
+
+3. NÃO pare após 3 ou 4 manchetes - CONTINUE até encontrar TODAS (5-7 típicas)
+
+📋 FORMATO JSON:
+{
+  "headlines": [
+    {
+      "title": "título completo da manchete 1",
+      "content": "texto resumido em 175 caracteres da notícia",
+      "url": "URL completa do link https://click.comunicacao-exame.com/..."
+    },
+    {
+      "title": "título completo da manchete 2",
+      "content": "texto resumido em 175 caracteres da notícia",
+      "url": "URL completa..."
+    },
+    ... (CONTINUE para TODAS as manchetes - mínimo 5, típico 5-7)
+  ]
+}
+
+✅ CHECKLIST ANTES DE RETORNAR:
+□ Encontrei a primeira manchete (26px)?
+□ Encontrei TODAS as manchetes com 20px?
+□ Tenho pelo menos 5 manchetes? (se não, PROCURE MAIS!)
+□ Cada manchete tem título, conteúdo E URL?
+□ Os URLs são do tipo "click.comunicacao-exame.com"?
+□ O conteúdo está resumido em 175 caracteres?
+
+⚠️ ERROS COMUNS A EVITAR:
+❌ Parar após 3-4 manchetes (newsletter tem 5-7!)
+❌ Pular manchetes no meio do documento
+❌ Incluir apenas manchetes com URLs encontradas facilmente
+
+✅ REGRAS:
+- Extraia o conteúdo resumido em 175 caracteres de cada manchete
+- Garanta que capturou a URL correta para cada manchete
+- Se não encontrar URL, coloque null mas INCLUA a manchete
+- Retorne TODAS as manchetes encontradas (mínimo 5, típico 5-7)
+- A primeira manchete é maior (26px), trate todas igualmente
+
+Retorne APENAS JSON (sem ``` ou markdown):"""
+    
+    try:
+        messages = [
+            {
+                "role": "user",
+                "content": f"{extraction_prompt}\n\nCONTEÚDO DA NEWSLETTER:\n{cleaned_content}"
+            }
+        ]
+        
+        response = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=messages,
+            temperature=0.05,
+            max_tokens=8192,
+            top_p=0.9
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Extract JSON
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+        
+        sections = json.loads(response_text)
+        
+        # Validate we have enough headlines
+        if sections.get('headlines') and len(sections['headlines']) < 5:
+            st.warning(f"⚠️ Only {len(sections['headlines'])} headlines found. Expected 5-7. Try processing again.")
+        
+        return sections
+        
+    except Exception as e:
+        st.error(f"Error in Groq extraction: {e}")
+        return None
+
+
+
+def extract_bloomberg(groq_client, html_content):
+    """Extract Bloomberg newsletter with Portuguese translation and smart summaries"""
+    
+    cleaned_content = clean_html_for_extraction(html_content)
+    
+    char_limit = 50000
+    if len(cleaned_content) > char_limit:
+        cleaned_content = cleaned_content[:char_limit]
+    
+    extraction_prompt = """Você é um especialista em análise e tradução de newsletters da Bloomberg.
+
+🎯 OBJETIVO: Extrair notícias e Deep Dive, traduzir para português, retornar conteúdo completo.
+
+📝 ESTRUTURA:
+1. "Good morning." (IGNORAR)
+2. "Markets Snapshot" (IGNORAR)
+3. **NOTÍCIAS EM PARÁGRAFOS** ← COMEÇAR
+   - 8-12 notícias com headline em NEGRITO
+4. **"Deep Dive:"** ← SEÇÃO 1
+   - Conteúdo COMPLETO
+5. **"The Big Take"** ← SEÇÃO 2 (CAPTURAR)
+   - Conteúdo COMPLETO
+6. **"Opinion"** ← SEÇÃO 3 (CAPTURAR)
+   - Conteúdo COMPLETO
+7. [Outras seções] (PARAR)
+
+📋 FORMATO JSON:
+{
+  "news_paragraphs": [
+    {
+      "headline": "manchete concisa em português (5-10 palavras)",
+      "content": "conteúdo em português (detalhes COMPLEMENTARES, não repita a manchete)"
+    },
+    ...
+  ],
+  "deep_dive": {
+    "content": "conteúdo COMPLETO da seção Deep Dive em português"
+  },
+  "big_take": {
+    "content": "conteúdo COMPLETO da seção The Big Take em português"
+  },
+  "opinion": {
+    "content": "conteúdo COMPLETO da seção Opinion em português"
+  }
+}
+
+⚠️ CRÍTICO - ESTRUTURA:
+- news_paragraphs: headlines em NEGRITO no original
+- Headline = manchete concisa (5-10 palavras)
+- Content = detalhes COMPLEMENTARES (NÃO repita palavras da manchete!)
+- Se headline é "Tesla anuncia lucros", content deve ser "A receita cresceu 40%...", NÃO "Tesla anunciou lucros..."
+- deep_dive, big_take, opinion = conteúdo COMPLETO de cada seção
+- NÃO misture seções
+
+⚠️ IMPORTANTE:
+- TRADUZA tudo para português brasileiro
+- Maximize uso do limite com informação NOVA, não redundante
+- Deep Dive, Big Take, Opinion = conteúdo COMPLETO de cada seção
+- CAPTURE todas as 4 estruturas
+
+Retorne APENAS JSON:"""
+    
+    try:
+        messages = [{"role": "user", "content": f"{extraction_prompt}\n\nCONTEÚDO:\n{cleaned_content}"}]
+        
+        response = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=messages,
+            temperature=0.05,
+            max_tokens=8192,
+            top_p=0.9
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        response_text = response_text.replace('```json', '').replace('```', '').strip()
+        
+        import re
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+        
+        sections = json.loads(response_text)
+        
+        # News: 150 chars with non-redundant summaries
+        if sections.get('news_paragraphs'):
+            for item in sections['news_paragraphs']:
+                headline = item.get('headline', '')
+                full_content = item.get('content', '')
+                if full_content:
+                    # Pass headline to avoid redundancy in summary
+                    item['summary'] = create_smart_summary(groq_client, full_content, max_chars=250, title=headline)
+        
+        # Deep Dive, Big Take, Opinion: Full content (no summarization needed)
+        # They will be displayed in full
+        
+        news_count = len(sections.get('news_paragraphs', []))
+        has_deep_dive = 'deep_dive' in sections and sections['deep_dive']
+        has_big_take = 'big_take' in sections and sections['big_take']
+        has_opinion = 'opinion' in sections and sections['opinion']
+        
+        if news_count < 5:
+            st.warning(f"⚠️ Apenas {news_count} notícias encontradas. Esperado: 8-12.")
+        
+        sections_found = []
+        if has_deep_dive:
+            sections_found.append("Deep Dive")
+        if has_big_take:
+            sections_found.append("Big Take")
+        if has_opinion:
+            sections_found.append("Opinion")
+        
+        if not has_deep_dive:
+            st.warning("⚠️ Seção Deep Dive não encontrada!")
+        if not has_big_take:
+            st.warning("⚠️ Seção The Big Take não encontrada!")
+        if not has_opinion:
+            st.warning("⚠️ Seção Opinion não encontrada!")
+        
+        return sections
+        
+    except Exception as e:
+        st.error(f"Erro na extração: {e}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
+
+
+def display_investnews(sections):
+    """Display InvestNews content with colored cards per section"""
+    
+    # Define colors for each section
+    colors = {
+        'main_story': '#2C4F7C',           # Dark blue
+        'highlights': "#376299",           # Slightly lighter blue
+        'segunda_materia': '#3A6B8F',      # Medium blue
+        'vale_parar_para_ler': '#4A7FA3'   # Light blue
+    }
+    
+    # Main Story
+    if sections.get('main_story') and sections['main_story']:
+        st.markdown("### 📰 MANCHETE PRINCIPAL")
+        content = sections['main_story'].get('content', 'N/A')
+        url = sections['main_story'].get('url')
+        
+        link_html = ""
+        if url:
+            link_html = f"<a href='{url}' target='_blank' style='color: #d4af37; text-decoration: none; font-weight: bold; font-size: 1.2rem;'>[+]</a>"
+        
+        st.markdown(f"""
+        <div style='background-color: {colors['main_story']}; color: white; padding: 2rem; 
+                    border-radius: 12px; margin-bottom: 1.5rem; border-left: 5px solid #d4af37;'>
+            <p style='font-size: 1rem; line-height: 1.7; white-space: pre-wrap; margin: 0;'>{content} {link_html}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Highlights - formatted cards (3 columns)
+    if sections.get('highlights') and len(sections['highlights']) > 0:
+        st.markdown("### ⚡ DESTAQUES")
+        cols = st.columns(3)
+
+        for i, highlight in enumerate(sections['highlights'][:3]):
+            with cols[i]:
+                title = highlight.get('title', 'N/A')
+                content = highlight.get('content', 'N/A')
+                url = highlight.get('url')
+                
+                link_html = ""
+                if url:
+                    link_html = f"<a href='{url}' target='_blank' style='color: #d4af37; text-decoration: none; font-weight: bold; font-size: 1.2rem;'>[+]</a>"
+
+                st.markdown(f"""
+                <div style='background-color: {colors['highlights']}; color: white; padding: 1.5rem; 
+                            border-radius: 12px; margin-bottom: 1.5rem; border-left: 5px solid #d4af37; height: 100%;'>
+                    <strong style='font-size: 1.1rem; display: block; margin-bottom: 1rem;'>{title}</strong>
+                    <p style='font-size: 0.95rem; line-height: 1.6; margin: 0;'>{content} {link_html}</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+    # Segunda Matéria
+    if sections.get('segunda_materia') and sections['segunda_materia']:
+        st.markdown("### 📋 SEGUNDA MATÉRIA")
+        content = sections['segunda_materia'].get('content', 'N/A')
+        url = sections['segunda_materia'].get('url')
+        
+        link_html = ""
+        if url:
+            link_html = f"<a href='{url}' target='_blank' style='color: #d4af37; text-decoration: none; font-weight: bold; font-size: 1.2rem;'>[+]</a>"
+
+        st.markdown(f"""
+        <div style='background-color: {colors['segunda_materia']}; color: white; padding: 2rem; 
+                    border-radius: 12px; margin-bottom: 1.5rem; border-left: 5px solid #d4af37;'>
+            <p style='font-size: 1rem; line-height: 1.7; white-space: pre-wrap; margin: 0;'>{content} {link_html}</p>
+            
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Vale Parar Para Ler - 2 columns
+    if sections.get('vale_parar_para_ler') and len(sections['vale_parar_para_ler']) > 0:
+        st.markdown("### 📚 VALE PARAR PARA LER")
+        cols = st.columns(2)
+        
+        for i, item in enumerate(sections['vale_parar_para_ler'][:2]):
+            with cols[i]:
+                title = item.get('title', 'N/A')
+                content = item.get('content', 'N/A')
+                url = item.get('url')
+                
+                link_html = ""
+                if url:
+                    link_html = f"<a href='{url}' target='_blank' style='color: #d4af37; text-decoration: none; font-weight: bold; font-size: 1.2rem;'>[+]</a>"
+
+                st.markdown(f"""
+                <div style='background-color: {colors['vale_parar_para_ler']}; color: white; padding: 1.5rem; 
+                            border-radius: 12px; margin-bottom: 1rem; border-left: 5px solid #d4af37; height: 100%;'>
+                    <strong style='font-size: 1.1rem; display: block; margin-bottom: 1rem;'>{title}</strong>
+                    <p style='font-size: 0.95rem; line-height: 1.6; margin: 0;'>{content} {link_html}</p>
+                    
+                </div>
+                """, unsafe_allow_html=True)
+
+
+
+def display_exame(sections):
+    """Display Exame content with colored cards - 2 blocks per row"""
+    
+    # Color for Exame headlines
+    card_color = '#2D5A3B'  # Dark green
+    
+    if sections.get('headlines'):
+        headlines = sections['headlines']
+        
+        # Display in rows of 2
+        for i in range(0, len(headlines), 2):
+            cols = st.columns(2)
+            
+            # First column
+            with cols[0]:
+                if i < len(headlines):
+                    headline = headlines[i]
+                    title = headline.get('title', 'N/A')
+                    content_text = headline.get('content', 'N/A')
+                    url = headline.get('url', '#')
+                    
+                    # Create link HTML
+                    link_html = ""
+                    if url and url != '#':
+                        link_html = f"<a href='{url}' target='_blank' style='color: #d4af37; text-decoration: none; font-weight: bold; font-size: 1.2rem;'>[+]</a>"
+                    
+                    st.markdown(f"""
+                    <div style='background-color: {card_color}; color: white; padding: 1.5rem; 
+                                border-radius: 12px; margin-bottom: 1rem; border-left: 5px solid #d4af37; height: 100%; min-height: 200px;'>
+                        <strong style='font-size: 1.1rem; color: #d4af37; display: block; margin-bottom: 1rem;'>{title}</strong>
+                        <p style='font-size: 0.95rem; line-height: 1.6; margin: 0;'>{content_text} {link_html}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            # Second column
+            with cols[1]:
+                if i + 1 < len(headlines):
+                    headline = headlines[i + 1]
+                    title = headline.get('title', 'N/A')
+                    content_text = headline.get('content', 'N/A')
+                    url = headline.get('url', '#')
+                    
+                    # Create link HTML
+                    link_html = ""
+                    if url and url != '#':
+                        link_html = f"<a href='{url}' target='_blank' style='color: #d4af37; text-decoration: none; font-weight: bold; font-size: 1.2rem;'>[+]</a>"
+                    
+                    st.markdown(f"""
+                    <div style='background-color: {card_color}; color: white; padding: 1.5rem; 
+                                border-radius: 12px; margin-bottom: 1rem; border-left: 5px solid #d4af37; height: 100%; min-height: 200px;'>
+                        <strong style='font-size: 1.1rem; color: #d4af37; display: block; margin-bottom: 1rem;'>{title}</strong>
+                        <p style='font-size: 0.95rem; line-height: 1.6; margin: 0;'>{content_text} {link_html}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+
+
+def display_bloomberg(sections):
+    """Display Bloomberg content with colored solid cards per section"""
+    
+    # Define solid colors for each Bloomberg section
+    colors = {
+        'deep_dive': '#4A5D8C',     # Purple-blue (solid)
+        'big_take': '#8C4A7A',      # Pink-purple (solid)
+        'opinion': '#4A8C8C'        # Cyan-teal (solid)
+    }
+    
+    # Deep Dive section - Full content
+    if sections.get('deep_dive') and sections['deep_dive']:
+        st.markdown("### 🔍 DEEP DIVE")
+        
+        deep_dive = sections['deep_dive']
+        content_text = deep_dive.get('content', 'N/A')
+        
+        st.markdown(f"""
+        <div style='background-color: {colors['deep_dive']}; color: white; padding: 2rem; 
+                    border-radius: 12px; margin-bottom: 1.5rem; border-left: 5px solid #d4af37;'>
+            <p style='font-size: 0.95rem; line-height: 1.6; white-space: pre-wrap; margin: 0;'>{content_text}</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # The Big Take section - Full content
+    if sections.get('big_take') and sections['big_take']:
+        st.markdown("### 📊 THE BIG TAKE")
+        
+        big_take = sections['big_take']
+        content_text = big_take.get('content', 'N/A')
+        
+        st.markdown(f"""
+        <div style='background-color: {colors['big_take']}; color: white; padding: 2rem; 
+                    border-radius: 12px; margin-bottom: 1.5rem; border-left: 5px solid #d4af37;'>
+            <p style='font-size: 0.95rem; line-height: 1.6; white-space: pre-wrap; margin: 0;'>{content_text}</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Opinion section - Full content
+    if sections.get('opinion') and sections['opinion']:
+        st.markdown("### 💭 OPINION")
+        
+        opinion = sections['opinion']
+        content_text = opinion.get('content', 'N/A')
+        
+        st.markdown(f"""
+        <div style='background-color: {colors['opinion']}; color: white; padding: 2rem; 
+                    border-radius: 12px; margin-bottom: 1.5rem; border-left: 5px solid #d4af37;'>
+            <p style='font-size: 0.95rem; line-height: 1.6; white-space: pre-wrap; margin: 0;'>{content_text}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+
+
+
+def extract_bloomberg_evening(groq_client, html_content):
+    """
+    Extract Bloomberg Evening Briefing content.
+    Structure:
+    1. Main news: Content after first image until "What You Need to Know Today"
+    2. News items: Between <hr> tags, starting with bold text
+       - Ignore items with "Read the Story" or "See More"
+       - Stop at "What You'll Need to Know Tomorrow"
+    All content translated to Portuguese.
+    """
+    from bs4 import BeautifulSoup
+    import re
+    import json
+    
+    try:
+        # Limit content size
+        if len(html_content) > 50000:
+            html_content = html_content[:50000]
+        
+        # Clean HTML
+        cleaned_content = html_content.replace('\r\n', '\n').replace('\t', ' ')
+        
+        prompt = f"""You are extracting content from a Bloomberg Evening Briefing newsletter.
+
+CRITICAL INSTRUCTIONS:
+1. Extract content in ENGLISH first
+2. Translate EVERYTHING to Portuguese (Brasil)
+3. Keep summaries CLOSE TO 400 characters (minimum 350, maximum 400)
+4. Preserve key details, numbers, names, and context
+
+TASK: Extract the following sections:
+
+1. MAIN NEWS: Find the paragraphs AFTER the Bloomberg logo/image and BEFORE the section "What You Need to Know Today". This is typically 2-3 paragraphs about the main story. Extract the full content and translate to Portuguese, keeping it between 350-400 characters.
+
+2. NEWS ITEMS: After "What You Need to Know Today", there are several news items separated by <hr> tags. Each item has:
+   - A bold headline (in <strong> or <b> tags)
+   - Content paragraphs following the headline
+   
+   For each item:
+   - Translate headline to Portuguese
+   - Translate content to Portuguese, keeping between 350-400 characters
+   - SKIP items that contain "Read the Story" or "See More" buttons
+   - STOP when you reach "What You'll Need to Know Tomorrow"
+
+Return this EXACT JSON structure (no backticks, no markdown):
+{{
+  "main_news": "notícia principal traduzida para português (350-400 chars)",
+  "news_items": [
+    {{"headline": "manchete traduzida", "content": "conteúdo traduzido (350-400 chars)"}},
+    {{"headline": "manchete traduzida", "content": "conteúdo traduzido (350-400 chars)"}}
+  ]
+}}
+
+HTML:
+{cleaned_content}
+"""
+        
+        response = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=8192
+        )
+        
+        result = response.choices[0].message.content.strip()
+        
+        if not result:
+            st.error("AI retornou resposta vazia")
+            return {}
+        
+        # Clean response - remove markdown code blocks
+        result = result.replace('```json', '').replace('```', '').strip()
+        
+        # Try to find JSON in response if it has extra text
+        json_match = re.search(r'\{[\s\S]*\}', result)
+        if json_match:
+            result = json_match.group(0)
+        
+        # Parse JSON
+        sections = json.loads(result)
+        
+        # Validate structure
+        if not isinstance(sections, dict):
+            st.error("Resposta não é um dicionário válido")
+            return {}
+        
+        if not sections.get('main_news'):
+            sections['main_news'] = ''
+        
+        if not sections.get('news_items'):
+            sections['news_items'] = []
+        
+        # Ensure content is close to 400 chars (only trim if way over)
+        for item in sections.get('news_items', []):
+            if 'content' in item and len(item['content']) > 420:
+                item['content'] = item['content'][:397] + '...'
+        
+        # Ensure main news is close to 400 chars (only trim if way over)
+        if len(sections['main_news']) > 420:
+            sections['main_news'] = sections['main_news'][:397] + '...'
+        
+        return sections
+        
+    except json.JSONDecodeError as e:
+        st.error(f"Erro ao decodificar JSON: {str(e)}")
+        st.error(f"Resposta da IA (primeiros 500 chars): {result[:500]}...")
+        return {}
+    except Exception as e:
+        st.error(f"Erro na extração Bloomberg Evening: {str(e)}")
+        return {}
+
+
+def display_bloomberg_evening(sections):
+    """Display Bloomberg Evening content with dark blue/evening theme"""
+    
+    if not sections:
+        st.warning("⚠️ Nenhum conteúdo extraído")
+        return
+    
+    # Main news
+    main_news = sections.get('main_news', '')
+    if main_news:
+        st.markdown(f"""
+        <div style="background-color: #1A2332; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
+            <p style="color: white; font-size: 16px; line-height: 1.6; margin: 0;">
+                {main_news}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # News items
+    news_items = sections.get('news_items', [])
+    if news_items:
+        
+        # Display in 2 columns
+        for i in range(0, len(news_items), 2):
+            col1, col2 = st.columns(2)
+            
+            # First item in row
+            with col1:
+                if i < len(news_items):
+                    item = news_items[i]
+                    headline = item.get('headline', '')
+                    content = item.get('content', '')
+                    
+                    st.markdown(f"""
+                    <div style="background-color: #2C3E5D; padding: 15px; border-radius: 8px; margin-bottom: 15px; min-height: 150px;">
+                        <p style="color: white; font-weight: bold; margin-bottom: 10px; font-size: 15px;">
+                            {headline}
+                        </p>
+                        <p style="color: #E0E0E0; font-size: 14px; line-height: 1.5; margin: 0;">
+                            {content}
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            # Second item in row
+            with col2:
+                if i + 1 < len(news_items):
+                    item = news_items[i + 1]
+                    headline = item.get('headline', '')
+                    content = item.get('content', '')
+                    
+                    st.markdown(f"""
+                    <div style="background-color: #2C3E5D; padding: 15px; border-radius: 8px; margin-bottom: 15px; min-height: 150px;">
+                        <p style="color: white; font-weight: bold; margin-bottom: 10px; font-size: 15px;">
+                            {headline}
+                        </p>
+                        <p style="color: #E0E0E0; font-size: 14px; line-height: 1.5; margin: 0;">
+                            {content}
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+    else:
+        st.warning("⚠️ No news items found")
+
+def save_to_database(supabase_client, newsletter_type, parsed_email, sections):
+    """Save processed newsletter to Supabase"""
+    try:
+        # Create unique ID
+        content_hash = hashlib.md5(
+            f"{parsed_email['subject']}{parsed_email['date']}".encode()
+        ).hexdigest()
+        
+        # Prepare data - use email_date instead of date
+        data = {
+            'id': content_hash,
+            'newsletter_type': newsletter_type,
+            'subject': parsed_email['subject'],
+            'sender': parsed_email['sender'],
+            'email_date': parsed_email['date'],  # Changed from 'date' to 'email_date'
+            'sections': sections,
+            'processed_at': datetime.now().isoformat()
+        }
+        
+        # Insert or update
+        result = supabase_client.table('newsletters').upsert(data).execute()
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"Error saving to database: {e}")
+        return False
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NOTICIÁRIO RENDA FIXA FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_noticiario_renda_fixa(html_content):
+    """
+    Parse the Noticiário Renda Fixa HTML file and extract daily news sections.
+    
+    Returns:
+        List of dictionaries, each containing:
+        - date: The date string (e.g., "Quarta-feira, 07 de Janeiro")
+        - sections: Dictionary with keys: 'leitura_da_curva', 'mercados_globais', 'mercado_domestico', 'noticiario_corporativo'
+    """
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        daily_reports = []
+        
+        # Find all h2 tags that contain the date pattern
+        date_headers = soup.find_all('h2', class_='wp-block-heading')
+        
+        for date_header in date_headers:
+            date_text = date_header.get_text(strip=True)
+            
+            # Check if this is a date header (contains day of week)
+            days_of_week = ['Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira']
+            if not any(day in date_text for day in days_of_week):
+                continue
+            
+            # Initialize the daily report structure
+            daily_report = {
+                'date': date_text,
+                'leitura_da_curva_date': '',  # Will store the date from LEITURA DA CURVA
+                'sections': {
+                    'leitura_da_curva': {'title': 'LEITURA DA CURVA', 'content': ''},
+                    'mercados_globais': {'title': 'MERCADOS GLOBAIS', 'items': []},
+                    'mercado_domestico': {'title': 'MERCADO DOMÉSTICO', 'items': []},
+                    'noticiario_corporativo': {'title': 'NOTICIÁRIO CORPORATIVO', 'subsections': {}}
+                }
+            }
+            
+            # Process elements after the date header
+            current = date_header.find_next_sibling()
+            current_section = None
+            current_subsection = None
+            
+            while current:
+                # Stop if we hit another date header or RELATÓRIOS DA SEMANA
+                if current.name == 'h2':
+                    h2_text = current.get_text(strip=True)
+                    if any(day in h2_text for day in days_of_week):
+                        break
+                    if 'RELATÓRIOS DA SEMANA' in h2_text:
+                        break
+                
+                if current.name == 'p':
+                    text = current.get_text(strip=True)
+                    
+                    # Check for RELATÓRIOS DA SEMANA - end this day immediately
+                    if 'RELATÓRIOS DA SEMANA' in text:
+                        break
+                    
+                    # Check if this is LEITURA DA CURVA (has orange background)
+                    if current.get('style') and '#fcb90078' in current.get('style'):
+                        # Extract the date from LEITURA DA CURVA title
+                        strong_tag = current.find('strong')
+                        if strong_tag:
+                            leitura_title = strong_tag.get_text(strip=True)
+                            # Extract date part (after the dash)
+                            if '–' in leitura_title:
+                                daily_report['leitura_da_curva_date'] = leitura_title.split('–')[1].strip()
+                            
+                            # Remove the strong tag content from the text to get only the body
+                            text_without_title = text.replace(leitura_title, '').strip()
+                            daily_report['sections']['leitura_da_curva']['content'] = text_without_title
+                        else:
+                            daily_report['sections']['leitura_da_curva']['content'] = text
+                        
+                        current_section = 'leitura_da_curva'
+                        current_subsection = None
+                    
+                    # Check if this paragraph contains section headers
+                    elif current.find('strong'):
+                        # Get all text from all strong tags combined
+                        strong_tags = current.find_all('strong')
+                        combined_strong_text = ' '.join([tag.get_text(strip=True) for tag in strong_tags])
+                        
+                        # Check for section headers
+                        if 'MERCADOS GLOBAIS' in combined_strong_text:
+                            current_section = 'mercados_globais'
+                            current_subsection = None
+                        elif 'MERCADO' in combined_strong_text and 'DOMÉSTICO' in combined_strong_text:
+                            # Handle "MERCADO DOMÉSTICO" which might be split across multiple <strong> tags
+                            current_section = 'mercado_domestico'
+                            current_subsection = None
+                        elif 'NOTICIÁRIO CORPORATIVO' in combined_strong_text:
+                            current_section = 'noticiario_corporativo'
+                            current_subsection = None
+                        # Check for subsections in NOTICIÁRIO CORPORATIVO (e.g., "| Agronegócio")
+                        elif current_section == 'noticiario_corporativo' and combined_strong_text.startswith('|'):
+                            # Extract subsection name (remove the "|" and trim)
+                            current_subsection = combined_strong_text[1:].strip()
+                            if current_subsection not in daily_report['sections']['noticiario_corporativo']['subsections']:
+                                daily_report['sections']['noticiario_corporativo']['subsections'][current_subsection] = []
+                    
+                    # Collect news items for the current section
+                    else:
+                        # Check if this paragraph has a link (news item)
+                        link = current.find('a')
+                        if link and current_section:
+                            news_item = {
+                                'title': link.get_text(strip=True),
+                                'url': link.get('href', ''),
+                                'source': '',
+                                'description': ''
+                            }
+                            
+                            # Get the full paragraph text
+                            full_text = current.get_text()
+                            
+                            # Extract and remove the link text
+                            link_text = link.get_text()
+                            description = full_text.replace(link_text, '', 1).strip()
+                            
+                            # Extract source (usually in <em> tags or plain text in parentheses)
+                            em_tag = current.find('em')
+                            source_text = ''
+                            
+                            if em_tag:
+                                # Source is in <em> tag
+                                source_text = em_tag.get_text(strip=True).strip('().')
+                                news_item['source'] = f"({source_text})"
+                                # Remove the em tag text from description
+                                em_text = em_tag.get_text()
+                                description = description.replace(em_text, '', 1).strip()
+                            else:
+                                # Check if source is in plain text format like "(Source)." at the beginning
+                                # Look for pattern: (Something). at the start
+                                import re
+                                source_pattern = r'^\(([^)]+)\)\.?\s*'
+                                match = re.match(source_pattern, description)
+                                if match:
+                                    source_text = match.group(1).strip()
+                                    # Only use if not empty
+                                    if source_text:
+                                        news_item['source'] = f"({source_text})"
+                                    # Remove the source from description
+                                    description = re.sub(source_pattern, '', description).strip()
+                            
+                            # Clean up leading unwanted characters and punctuation
+                            description = description.lstrip('().,:; ')
+                            
+                            # Handle special case: "apurou o [Source]" at the end
+                            # This pattern means the source name appears at the end
+                            if 'apurou o ' in description.lower():
+                                # Check if there's a source name after "apurou o"
+                                parts = description.rsplit('apurou o ', 1)
+                                if len(parts) == 2:
+                                    # Extract what comes after "apurou o"
+                                    after_apurou = parts[1].strip().rstrip('.')
+                                    
+                                    # If we don't have a source yet, use this as the source
+                                    if not source_text and after_apurou:
+                                        news_item['source'] = f"({after_apurou})"
+                                    
+                                    # Keep the full description including "apurou o [Source]"
+                            
+                            # Clean up extra spaces and normalize
+                            description = ' '.join(description.split())
+                            
+                            # Remove any trailing periods before adding our own
+                            description = description.rstrip('.')
+                            
+                            # Add ending period if there's content
+                            if description:
+                                description = description + '.'
+                            
+                            news_item['description'] = description
+                            
+                            # Add to appropriate section
+                            if current_section == 'noticiario_corporativo' and current_subsection:
+                                daily_report['sections']['noticiario_corporativo']['subsections'][current_subsection].append(news_item)
+                            elif current_section in ['mercados_globais', 'mercado_domestico']:
+                                daily_report['sections'][current_section]['items'].append(news_item)
+                
+                current = current.find_next_sibling()
+            
+            # Only add the report if it has content
+            if daily_report['sections']['leitura_da_curva']['content'] or \
+               daily_report['sections']['mercados_globais']['items'] or \
+               daily_report['sections']['mercado_domestico']['items'] or \
+               daily_report['sections']['noticiario_corporativo']['subsections']:
+                daily_reports.append(daily_report)
+        
+        return daily_reports
+        
+    except Exception as e:
+        st.error(f"Erro ao processar arquivo HTML: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return []
+
+
+def display_noticiario_renda_fixa(daily_reports):
+    """
+    Display the parsed Noticiário Renda Fixa in a beautiful, collapsible format.
+    
+    Args:
+        daily_reports: List of daily report dictionaries from parse_noticiario_renda_fixa
+    """
+    if not daily_reports:
+        st.warning("Nenhum conteúdo encontrado no arquivo.")
+        return
+    
+    # Custom CSS for the news display
+    st.markdown("""
+        <style>
+        .news-date-header {
+            font-family: 'Playfair Display', serif;
+            font-size: 28px;
+            font-weight: 700;
+            color: #d4af37;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%);
+            border-left: 5px solid #d4af37;
+            border-radius: 5px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        
+        .section-box {
+            background-color: #1a1a1a;
+            border: 1px solid #d4af37;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .section-title {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 20px;
+            font-weight: 600;
+            color: #f4d03f;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #d4af37;
+        }
+        
+        .leitura-curva-box {
+            background: linear-gradient(135deg, #2a1a0a 0%, #1a1a1a 100%);
+            border: 2px solid #fcb900;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .leitura-curva-content {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 15px;
+            line-height: 1.8;
+            color: #e0e0e0;
+            text-align: justify;
+        }
+        
+        .news-item {
+            background-color: #0f0f0f;
+            border-left: 3px solid #d4af37;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 5px;
+            transition: all 0.3s ease;
+        }
+        
+        .news-item:hover {
+            background-color: #1a1a1a;
+            border-left-color: #f4d03f;
+            transform: translateX(5px);
+        }
+        
+        .news-title {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 16px;
+            font-weight: 600;
+            color: #d4af37;
+            margin-bottom: 8px;
+        }
+        
+        .news-title a {
+            color: #d4af37;
+            text-decoration: none;
+        }
+        
+        .news-title a:hover {
+            color: #f4d03f;
+            text-decoration: underline;
+        }
+        
+        .news-source {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 13px;
+            font-style: italic;
+            color: #888;
+            margin-bottom: 8px;
+        }
+        
+        .news-description {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #b0b0b0;
+            text-align: justify;
+        }
+        
+        .subsection-header {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 18px;
+            font-weight: 700;
+            color: #0a0a0a;
+            background: linear-gradient(135deg, #d4af37 0%, #f4d03f 100%);
+            margin-top: 25px;
+            margin-bottom: 15px;
+            padding: 12px 20px;
+            border-radius: 8px;
+            border-left: 5px solid #0a0a0a;
+            box-shadow: 0 2px 8px rgba(212, 175, 55, 0.3);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # Display each day in a collapsible expander
+    for report in daily_reports:
+        with st.expander(f"📅 {report['date']}", expanded=False):
+            
+            # LEITURA DA CURVA section
+            if report['sections']['leitura_da_curva']['content']:
+                # Build title with date if available
+                leitura_title = report['sections']['leitura_da_curva']['title']
+                if report.get('leitura_da_curva_date'):
+                    leitura_title = f"{leitura_title} – {report['leitura_da_curva_date']}"
+                
+                st.markdown(f"""
+                    <div class="leitura-curva-box">
+                        <div class="section-title">📊 {leitura_title}</div>
+                        <div class="leitura-curva-content">{report['sections']['leitura_da_curva']['content']}</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            # MERCADOS GLOBAIS section
+            if report['sections']['mercados_globais']['items']:
+                st.markdown(f"""
+                    <div class="section-box">
+                        <div class="section-title">🌍 {report['sections']['mercados_globais']['title']}</div>
+                """, unsafe_allow_html=True)
+                
+                for item in report['sections']['mercados_globais']['items']:
+                    st.markdown(f"""
+                        <div class="news-item">
+                            <div class="news-title"><a href="{item['url']}" target="_blank">{item['title']}</a></div>
+                            <div class="news-source">{item['source']}</div>
+                            <div class="news-description">{item['description']}</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            # MERCADO DOMÉSTICO section
+            if report['sections']['mercado_domestico']['items']:
+                st.markdown(f"""
+                    <div class="section-box">
+                        <div class="section-title">📍 {report['sections']['mercado_domestico']['title']}</div>
+                """, unsafe_allow_html=True)
+                
+                for item in report['sections']['mercado_domestico']['items']:
+                    st.markdown(f"""
+                        <div class="news-item">
+                            <div class="news-title"><a href="{item['url']}" target="_blank">{item['title']}</a></div>
+                            <div class="news-source">{item['source']}</div>
+                            <div class="news-description">{item['description']}</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            # NOTICIÁRIO CORPORATIVO section
+            if report['sections']['noticiario_corporativo']['subsections']:
+                st.markdown(f"""
+                    <div class="section-box">
+                        <div class="section-title">📰 {report['sections']['noticiario_corporativo']['title']}</div>
+                """, unsafe_allow_html=True)
+                
+                # Display each subsection
+                for subsection_name, items in report['sections']['noticiario_corporativo']['subsections'].items():
+                    st.markdown(f"""
+                        <div class="subsection-header">| {subsection_name}</div>
+                    """, unsafe_allow_html=True)
+                    
+                    for item in items:
+                        st.markdown(f"""
+                            <div class="news-item">
+                                <div class="news-title"><a href="{item['url']}" target="_blank">{item['title']}</a></div>
+                                <div class="news-source">{item['source']}</div>
+                                <div class="news-description">{item['description']}</div>
+                            </div>
+                        """, unsafe_allow_html=True)
+                
+                st.markdown("</div>", unsafe_allow_html=True)
+
+
+def save_noticiario_to_database(supabase_client, html_content, parsed_data, uploaded_by="admin"):
+    """Save Noticiário Renda Fixa data to Supabase"""
+    try:
+        data = {
+            'upload_date': datetime.now().isoformat(),
+            'uploaded_by': uploaded_by,
+            'html_content': html_content,
+            'parsed_data': parsed_data
+        }
+        
+        # Delete old records (keep only latest)
+        supabase_client.table('noticiario_renda_fixa').delete().neq('id', 0).execute()
+        
+        # Insert new record
+        result = supabase_client.table('noticiario_renda_fixa').insert(data).execute()
+        
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar noticiário no banco: {e}")
+        return False
+
+def load_noticiario_from_database(supabase_client):
+    """Load latest Noticiário Renda Fixa data from Supabase"""
+    try:
+        result = supabase_client.table('noticiario_renda_fixa').select('*').order('upload_date', desc=True).limit(1).execute()
+        
+        if result.data and len(result.data) > 0:
+            return result.data[0]
+        return None
+    except Exception as e:
+        st.error(f"Erro ao carregar noticiário do banco: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CURVAS ANBIMA FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# CURVAS ANBIMA FUNCTIONS (from news_v5.py)
+def check_admin_access():
+    """Check if user has admin access based on logged in user"""
+    return st.session_state.get('user_logged_in') == 'admin' 
+
+def save_curves_to_database(supabase_client, file_data, uploaded_by="admin"):
+    """Save curves data to Supabase"""
+    try:
+        data = {
+            'upload_date': datetime.now().isoformat(),
+            'uploaded_by': uploaded_by,
+            'file_data': file_data
+        }
+        
+        # Delete old records (keep only latest)
+        supabase_client.table('anbima_curves').delete().neq('id', 0).execute()
+        
+        # Insert new record
+        result = supabase_client.table('anbima_curves').insert(data).execute()
+        
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar no banco: {e}")
+        return False
+
+def load_curves_from_database(supabase_client):
+    """Load latest curves data from Supabase"""
+    try:
+        result = supabase_client.table('anbima_curves').select('*').order('upload_date', desc=True).limit(1).execute()
+        
+        if result.data and len(result.data) > 0:
+            return result.data[0]['file_data']
+        return None
+    except Exception as e:
+        st.error(f"Erro ao carregar dados: {e}")
+        return None
+
+def process_excel_to_json(excel_file):
+    """Convert Excel file to JSON format for storage"""
+    import pandas as pd
+    
+    try:
+        xl_file = pd.ExcelFile(excel_file)
+        
+        data = {}
+        for sheet_name in xl_file.sheet_names:
+            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+            # Store column order explicitly to preserve it
+            # This ensures Vértice (Anos) stays as first column
+            data[sheet_name] = {
+                'columns': df.columns.tolist(),  # Preserve column order
+                'data': df.to_dict('list')
+            }
+        
+        return data
+    except Exception as e:
+        st.error(f"Erro ao processar Excel: {e}")
+        return None
+
+def json_to_dataframes(json_data):
+    """Convert JSON data back to DataFrames"""
+    import pandas as pd
+    
+    try:
+        dataframes = {}
+        for sheet_name, sheet_data in json_data.items():
+            # Handle both old format (direct dict) and new format (with columns key)
+            if isinstance(sheet_data, dict) and 'columns' in sheet_data and 'data' in sheet_data:
+                # New format: explicitly preserved column order
+                df = pd.DataFrame(sheet_data['data'], columns=sheet_data['columns'])
+            else:
+                # Old format: backward compatibility
+                df = pd.DataFrame(sheet_data)
+            
+            dataframes[sheet_name] = df
+        return dataframes
+    except Exception as e:
+        st.error(f"Erro ao converter dados: {e}")
+        return None
+
+def create_curves_table(df, index_name):
+    """Create table with rates for each vertex and date"""
+    if df is None or df.empty:
+        return None
+    
+    # Set the first column as index
+    df_copy = df.copy()
+    df_copy.set_index(df_copy.columns[0], inplace=True)
+    
+    return df_copy
+
+def create_curves_chart(df, index_name):
+    """Create chart for curves"""
+    if df is None or df.empty:
+        return None
+    
+    fig = go.Figure()
+    
+    # First column is vertices (anos), rest are dates
+    vertices = df.iloc[:, 0].values
+    date_columns = df.columns[1:]
+    
+    # Generate blue gradient (light to dark)
+    colors = generate_blue_gradient(len(date_columns))
+    
+    for i, date_col in enumerate(date_columns):
+        rates = df[date_col].values
+        
+        fig.add_trace(go.Scatter(
+            x=vertices,
+            y=rates,
+            mode='lines+markers',
+            line=dict(shape='spline', width=2.5, color=colors[i]),
+            name=str(date_col)
+        ))
+    
+    fig.update_layout(
+        title=index_name,
+        xaxis_title='Vértice (Anos)',
+        yaxis_title='Taxa (%)',
+        plot_bgcolor='#0a0a0a',
+        paper_bgcolor='#1a1a1a',
+        font=dict(color='#d4af37', family='Montserrat'),
+        xaxis=dict(showgrid=True, gridcolor='#333'),
+        yaxis=dict(showgrid=True, gridcolor='#333'),
+        legend=dict(bgcolor='#1a1a1a', bordercolor='#d4af37', borderwidth=1),
+        height=500
+    )
+    
+    return fig
+
+def calculate_curves_variations(df):
+    """Calculate rate variations between dates"""
+    if df is None or df.empty or len(df.columns) < 3:
+        return {}
+    
+    vertices = df.iloc[:, 0].values
+    date_columns = df.columns[1:]
+    
+    # Latest is last column, compare with previous dates
+    latest_rates = df[date_columns[-1]].values
+    
+    variations = {}
+    
+    for days_back in range(1, min(6, len(date_columns))):
+        past_col = date_columns[-(days_back + 1)]
+        past_rates = df[past_col].values
+        
+        # Calculate variations
+        var_list = []
+        for i, vertex in enumerate(vertices):
+            if pd.notna(latest_rates[i]) and pd.notna(past_rates[i]):
+                variation = latest_rates[i] - past_rates[i]
+                var_list.append((vertex, variation))
+        
+        # Sort by absolute value and take top 10
+        var_list.sort(key=lambda x: abs(x[1]), reverse=True)
+        variations[days_back] = var_list[:10]
+    
+    return variations
+# ═══════════════════════════════════════════════════════════════════════════════
+# CREDIT CURVES FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def save_credit_curves_to_database(supabase_client, file_data, uploaded_by="admin"):
+    """Save credit curves to database"""
+    if not supabase_client:
+        return False
+    
+    try:
+        # Delete old data
+        supabase_client.table('credito_curves').delete().neq('id', 0).execute()
+        
+        # Insert new data
+        data = {'file_data': file_data, 'uploaded_by': uploaded_by}
+        result = supabase_client.table('credito_curves').insert(data).execute()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar: {e}")
+        return False
+
+def load_credit_curves_from_database(supabase_client):
+    """Load latest credit curves from database"""
+    if not supabase_client:
+        return None
+    
+    try:
+        result = supabase_client.table('credito_curves').select('*').order('upload_date', desc=True).limit(1).execute()
+        
+        if result.data and len(result.data) > 0:
+            return result.data[0]['file_data']
+        return None
+    except Exception as e:
+        st.error(f"Erro ao carregar dados: {e}")
+        return None
+
+def process_credit_excel_to_json(excel_file):
+    """Convert credit Excel file to JSON format, removing rows with NaN"""
+    import pandas as pd
+    
+    try:
+        xl_file = pd.ExcelFile(excel_file)
+        
+        data = {}
+        for sheet_name in xl_file.sheet_names:
+            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+            
+            # Remove rows where ANY date column has NaN
+            # Keep Vértice column, check only date columns (1 onwards)
+            date_columns = df.columns[1:]
+            df_clean = df.dropna(subset=date_columns, how='any')
+            
+            # Store with explicit column order
+            data[sheet_name] = {
+                'columns': df_clean.columns.tolist(),
+                'data': df_clean.to_dict('list')
+            }
+        
+        return data
+    except Exception as e:
+        st.error(f"Erro ao processar Excel: {e}")
+        return None
+
+def create_credit_comparison_chart(dataframes, selected_date):
+    """Create comparison chart for all ratings on a selected date"""
+    if not dataframes:
+        return None
+    
+    fig = go.Figure()
+    
+    # Colors for ratings
+    colors = {'AAA': '#00e100', 'AA': '#FFD700', 'A': '#f20000'}
+    
+    for rating, df in dataframes.items():
+        if df is None or df.empty:
+            continue
+        
+        vertices = df.iloc[:, 0].values
+        
+        # Find the selected date column
+        if selected_date in df.columns:
+            rates = df[selected_date].values
+            
+            fig.add_trace(go.Scatter(
+                x=vertices,
+                y=rates,
+                mode='lines+markers',
+                line=dict(shape='spline', width=3, color=colors.get(rating, '#d4af37')),
+                marker=dict(size=6),
+                name=rating
+            ))
+    
+    fig.update_layout(
+        title=f'Comparativo de Spreads - {selected_date}',
+        xaxis_title='Vértice (Anos)',
+        yaxis_title='Spread (%)',
+        plot_bgcolor='#0a0a0a',
+        paper_bgcolor='#1a1a1a',
+        font=dict(color='#d4af37', family='Montserrat'),
+        xaxis=dict(showgrid=True, gridcolor='#333'),
+        yaxis=dict(showgrid=True, gridcolor='#333'),
+        legend=dict(bgcolor='#1a1a1a', bordercolor='#d4af37', borderwidth=1),
+        height=500
+    )
+    
+    return fig
+
+def calculate_spread_differences(dataframes, rating1, rating2, date):
+    """Calculate average spread difference between two ratings for a specific date
+    Returns: average of (lower_rated - higher_rated) across all vertices
+    """
+    df1 = dataframes.get(rating1)
+    df2 = dataframes.get(rating2)
+    
+    if df1 is None or df2 is None or date not in df1.columns or date not in df2.columns:
+        return None
+    
+    # Get common vertices
+    vertices1 = df1.iloc[:, 0].values
+    vertices2 = df2.iloc[:, 0].values
+    
+    # Use intersection of vertices
+    common_vertices = sorted(set(vertices1) & set(vertices2))
+    
+    differences = []
+    for vertex in common_vertices:
+        # Find rates for this vertex
+        rate1_idx = df1[df1.iloc[:, 0] == vertex].index
+        rate2_idx = df2[df2.iloc[:, 0] == vertex].index
+        
+        if len(rate1_idx) > 0 and len(rate2_idx) > 0:
+            rate1 = df1.loc[rate1_idx[0], date]
+            rate2 = df2.loc[rate2_idx[0], date]
+            
+            if pd.notna(rate1) and pd.notna(rate2):
+                # Lower rated (higher rate) - Higher rated (lower rate)
+                diff = rate1 - rate2
+                differences.append(diff)
+    
+    # Return average difference
+    if differences:
+        return sum(differences) / len(differences)
+    return None
+
+def create_credit_curves_chart(df, rating_name):
+    """Create chart for credit curves (one rating)"""
+    if df is None or df.empty:
+        return None
+    
+    fig = go.Figure()
+    
+    vertices = df.iloc[:, 0].values
+    date_columns = df.columns[1:]
+    
+    # Generate blue gradient (light to dark)
+    colors = generate_blue_gradient(len(date_columns))
+    
+    for i, date_col in enumerate(date_columns):
+        rates = df[date_col].values
+        
+        fig.add_trace(go.Scatter(
+            x=vertices,
+            y=rates,
+            mode='lines+markers',
+            line=dict(shape='spline', width=2.5, color=colors[i]),
+            name=str(date_col)
+        ))
+    
+    fig.update_layout(
+        title=f'Spread {rating_name}',
+        xaxis_title='Vértice (Anos)',
+        yaxis_title='Spread (%)',
+        plot_bgcolor='#0a0a0a',
+        paper_bgcolor='#1a1a1a',
+        font=dict(color='#d4af37', family='Montserrat'),
+        xaxis=dict(showgrid=True, gridcolor='#333'),
+        yaxis=dict(showgrid=True, gridcolor='#333'),
+        legend=dict(bgcolor='#1a1a1a', bordercolor='#d4af37', borderwidth=1),
+        height=500
+    )
+    
+    return fig
+
+def calculate_credit_variations(df):
+    """Calculate rate variations for credit curves (all vertices in order)"""
+    if df is None or df.empty or len(df.columns) < 3:
+        return {}
+    
+    vertices = df.iloc[:, 0].values
+    date_columns = df.columns[1:]
+    
+    # Latest is last column
+    latest_rates = df[date_columns[-1]].values
+    
+    variations = {}
+    
+    for days_back in range(1, min(6, len(date_columns))):
+        past_col = date_columns[-(days_back + 1)]
+        past_rates = df[past_col].values
+        
+        var_list = []
+        for i, vertex in enumerate(vertices):
+            if pd.notna(latest_rates[i]) and pd.notna(past_rates[i]):
+                variation = latest_rates[i] - past_rates[i]
+                var_list.append((vertex, variation))
+        
+        # Keep original order (no sorting)
+        variations[days_back] = var_list
+    
+    return variations
+
+def create_credit_table(df):
+    """Create table for credit curves"""
+    if df is None or df.empty:
+        return None
+    
+    df_copy = df.copy()
+    df_copy.set_index(df_copy.columns[0], inplace=True)
+    
+    return df_copy
+
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUPABASE HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SupabaseNewsletter:
+    """Helper class for Supabase newsletter operations"""
+    
+    def __init__(self):
+        self.url = SUPABASE_URL
+        self.key = SUPABASE_KEY
+        self.headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json"
+        }
+        self.table_name = "bloomberg_linea_newsletters"
+    
+    def save_newsletter(self, newsletter_type, content, source_name):
+        """Save or update newsletter in Supabase"""
+        if not self.url or not self.key:
+            return False
+        
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            
+            data = {
+                "newsletter_type": newsletter_type,
+                "content": content,
+                "source_name": source_name,
+                "upload_date": today,
+                "created_at": datetime.now().isoformat()
+            }
+            
+            # First, try to delete existing newsletter of same type for today
+            delete_url = f"{self.url}/rest/v1/{self.table_name}?newsletter_type=eq.{newsletter_type}&upload_date=eq.{today}"
+            requests.delete(delete_url, headers=self.headers)
+            
+            # Insert new newsletter
+            insert_url = f"{self.url}/rest/v1/{self.table_name}"
+            response = requests.post(insert_url, headers=self.headers, json=data)
+            
+            return response.status_code in [200, 201]
+        except Exception as e:
+            st.error(f"Erro ao salvar no Supabase: {str(e)}")
+            return False
+    
+    def get_todays_newsletters(self):
+        """Get all newsletters for today"""
+        if not self.url or not self.key:
+            return {}
+        
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            url = f"{self.url}/rest/v1/{self.table_name}?upload_date=eq.{today}"
+            
+            response = requests.get(url, headers=self.headers)
+            
+            if response.status_code == 200:
+                newsletters = response.json()
+                result = {}
+                for newsletter in newsletters:
+                    result[newsletter['newsletter_type']] = {
+                        'source': newsletter['source_name'],
+                        'timestamp': newsletter['upload_date'],
+                        'type': 'Newsletter Upload',
+                        'content': newsletter['content'],
+                        'status': 'success'
+                    }
+                return result
+            else:
+                return {}
+        except Exception as e:
+            return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEWSLETTER PARSERS - INVESTNEWS, EXAME, BLOOMBERG LÍNEA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NewsletterParser:
+    """Base parser for different newsletters"""
+    
+    @staticmethod
+    def parse_eml_file(uploaded_file):
+        """Parse .eml file and extract HTML content"""
+        try:
+            # Reset file pointer
+            uploaded_file.seek(0)
+            msg = email.message_from_bytes(uploaded_file.read(), policy=policy.default)
+            
+            # Extract HTML content
+            html_content = None
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/html':
+                        html_content = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        break
+            else:
+                if msg.get_content_type() == 'text/html':
+                    html_content = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+            
+            # Extract subject and date
+            subject = msg.get('Subject', 'Unknown')
+            date = msg.get('Date', 'Unknown')
+            
+            return {
+                'subject': subject,
+                'date': date,
+                'html': html_content
+            }
+        except Exception as e:
+            st.error(f"Erro ao analisar arquivo EML: {str(e)}")
+            return None
+    
+    @staticmethod
+    def extract_investnews(html_content):
+        """Extract structured content from Investnews newsletter"""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            sections = []
+            
+            # Section 1: First news from h1 until "Leia Mais"
+            h1_tags = soup.find_all('h1')
+            if h1_tags:
+                first_section = {
+                    'title': h1_tags[0].get_text(strip=True),
+                    'content': []
+                }
+                
+                current = h1_tags[0].find_next()
+                while current:
+                    text = current.get_text(strip=True) if current.name else ''
+                    if 'Leia Mais' in text:
+                        break
+                    if current.name == 'p':
+                        para_text = current.get_text(strip=True)
+                        if para_text:
+                            first_section['content'].append(para_text)
+                    current = current.find_next()
+                
+                sections.append(first_section)
+            
+            # Section 2: HIGHLIGHTS (h4 + three highlights)
+            highlights_h4 = soup.find('h4', string=lambda t: t and 'HIGHLIGHTS' in t.upper())
+            if highlights_h4:
+                highlights_section = {
+                    'title': 'HIGHLIGHTS',
+                    'content': []
+                }
+                
+                current = highlights_h4.find_next()
+                highlight_count = 0
+                current_highlight = None
+                
+                while current and highlight_count < 3:
+                    if current.name == 'h4':  # Stop if we hit another section
+                        break
+                    
+                    if current.name == 'p':
+                        text = current.get_text(strip=True)
+                        if not text:
+                            current = current.find_next()
+                            continue
+                        
+                        # Check if this p contains a <b> tag (headline)
+                        b_tag = current.find('b')
+                        if b_tag:
+                            # This is a new highlight headline
+                            if current_highlight:
+                                highlights_section['content'].append(current_highlight)
+                                highlight_count += 1
+                                if highlight_count >= 3:
+                                    break
+                            
+                            current_highlight = {
+                                'headline': b_tag.get_text(strip=True),
+                                'text': text.replace(b_tag.get_text(strip=True), '').strip()
+                            }
+                        else:
+                            # This is continuation of current highlight
+                            if current_highlight:
+                                current_highlight['text'] += ' ' + text
+                    
+                    current = current.find_next()
+                
+                # Add the last highlight
+                if current_highlight:
+                    highlights_section['content'].append(current_highlight)
+                
+                sections.append(highlights_section)
+            
+            # Section 4: Second news (next h1 until "Leia Mais")
+            if len(h1_tags) > 1:
+                second_section = {
+                    'title': h1_tags[1].get_text(strip=True),
+                    'content': []
+                }
+                
+                current = h1_tags[1].find_next()
+                while current:
+                    text = current.get_text(strip=True) if current.name else ''
+                    if 'Leia Mais' in text:
+                        break
+                    if current.name == 'p':
+                        para_text = current.get_text(strip=True)
+                        if para_text:
+                            second_section['content'].append(para_text)
+                    current = current.find_next()
+                
+                sections.append(second_section)
+            
+            # Section 8: VALE PARAR PARA LER (until "NOSSAS NEWSLETTERS")
+            vale_h4 = soup.find('h4', string=lambda t: t and 'VALE PARAR PARA LER' in t.upper())
+            if vale_h4:
+                vale_section = {
+                    'title': 'VALE PARAR PARA LER',
+                    'content': []
+                }
+                
+                current = vale_h4.find_next()
+                current_item = None
+                
+                while current:
+                    text = current.get_text(strip=True) if current.name else ''
+                    if 'NOSSAS NEWSLETTERS' in text:
+                        break
+                    
+                    if current.name == 'p':
+                        para_text = current.get_text(strip=True)
+                        if not para_text:
+                            current = current.find_next()
+                            continue
+                        
+                        # Check if this p contains a <b> tag (headline)
+                        b_tag = current.find('b')
+                        if b_tag:
+                            # This is a new item headline
+                            if current_item:
+                                vale_section['content'].append(current_item)
+                            
+                            current_item = {
+                                'headline': b_tag.get_text(strip=True),
+                                'text': para_text.replace(b_tag.get_text(strip=True), '').strip()
+                            }
+                        else:
+                            # This is continuation of current item
+                            if current_item:
+                                current_item['text'] += ' ' + para_text
+                    
+                    current = current.find_next()
+                
+                # Add the last item
+                if current_item:
+                    vale_section['content'].append(current_item)
+                
+                sections.append(vale_section)
+            
+            return sections
+        
+        except Exception as e:
+            st.error(f"Erro ao extrair conteúdo da Investnews: {str(e)}")
+            return None
+    
+    @staticmethod
+    def extract_exame(html_content):
+        """Extract structured content from Exame newsletter"""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            sections = []
+            
+            # Section 1: First news from h2 until first "SAIBA MAIS"
+            h2_tags = soup.find_all('h2')
+            if h2_tags:
+                first_section = {
+                    'title': h2_tags[0].get_text(strip=True),
+                    'content': []
+                }
+                
+                current = h2_tags[0].find_next()
+                while current:
+                    if current.name == 'a' and 'SAIBA MAIS' in current.get_text().upper():
+                        break
+                    if current.name == 'span':
+                        span_text = current.get_text(strip=True)
+                        if span_text:
+                            first_section['content'].append(span_text)
+                    current = current.find_next()
+                
+                sections.append(first_section)
+            
+            # Section 2: "O que mais você precisa saber hoje" - multiple h2 headlines with spans
+            marker_span = soup.find('span', string=lambda t: t and 'O que mais você precisa saber hoje' in t)
+            if marker_span:
+                # Find all h2 tags after this marker
+                current = marker_span.find_next('h2')
+                
+                while current and current.name == 'h2':
+                    # Check if we've hit "No radar" section
+                    if 'No radar' in current.get_text():
+                        break
+                    
+                    headline_section = {
+                        'title': current.get_text(strip=True),
+                        'content': []
+                    }
+                    
+                    # Find the span with content after this h2
+                    next_elem = current.find_next()
+                    while next_elem:
+                        if next_elem.name == 'h2':  # Next headline
+                            break
+                        if next_elem.name == 'a' and 'SAIBA MAIS' in next_elem.get_text().upper():
+                            break
+                        if next_elem.name == 'span':
+                            span_text = next_elem.get_text(strip=True)
+                            if span_text and 'O que mais você precisa saber hoje' not in span_text:
+                                headline_section['content'].append(span_text)
+                        next_elem = next_elem.find_next()
+                    
+                    if headline_section['content']:
+                        sections.append(headline_section)
+                    
+                    # Move to next h2
+                    current = next_elem if next_elem and next_elem.name == 'h2' else None
+            
+            return sections
+        
+        except Exception as e:
+            st.error(f"Erro ao extrair conteúdo da Exame: {str(e)}")
+            return None
+    
+    @staticmethod
+    def extract_bloomberg_linea(html_content):
+        """Extract structured content from Bloomberg Línea newsletter"""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            sections = []
+            
+            # Section 1: Main headline (h1) until "Leia a matéria completa →"
+            h1_tag = soup.find('h1')
+            if h1_tag:
+                main_section = {
+                    'title': h1_tag.get_text(strip=True),
+                    'content': []
+                }
+                
+                current = h1_tag.find_next()
+                while current:
+                    if current.name == 'a' and 'Leia a matéria completa' in current.get_text():
+                        break
+                    if current.name == 'p' or current.name == 'span':
+                        text = current.get_text(strip=True)
+                        if text:
+                            main_section['content'].append(text)
+                    current = current.find_next()
+                
+                sections.append(main_section)
+            
+            # Section 2: "No Radar" - every <strong> is a new headline
+            no_radar_span = soup.find('span', string=lambda t: t and 'No Radar' in t)
+            if no_radar_span:
+                radar_section = {
+                    'title': 'No Radar',
+                    'content': []
+                }
+                
+                current = no_radar_span.find_next()
+                current_item = None
+                
+                while current:
+                    if current.name == 'a' and 'Leia sobre o que move os mercados hoje' in current.get_text():
+                        break
+                    
+                    if current.name == 'strong':
+                        # New headline
+                        if current_item:
+                            radar_section['content'].append(current_item)
+                        current_item = {
+                            'headline': current.get_text(strip=True),
+                            'text': ''
+                        }
+                    elif current.name in ['p', 'span'] and current_item:
+                        # Content for current headline
+                        text = current.get_text(strip=True)
+                        # Skip the headline itself if it appears again
+                        if text != current_item['headline']:
+                            current_item['text'] += ' ' + text
+                    
+                    current = current.find_next()
+                
+                # Add the last item
+                if current_item:
+                    radar_section['content'].append(current_item)
+                
+                sections.append(radar_section)
+            
+            # Section 3: "Para não ficar de fora" until "Saiba mais →"
+            para_nao_span = soup.find('span', string=lambda t: t and 'Para não ficar de fora' in t)
+            if para_nao_span:
+                fora_section = {
+                    'title': 'Para não ficar de fora',
+                    'content': []
+                }
+                
+                current = para_nao_span.find_next()
+                while current:
+                    if current.name == 'a' and 'Saiba mais' in current.get_text():
+                        break
+                    if current.name in ['p', 'span']:
+                        text = current.get_text(strip=True)
+                        if text and 'Para não ficar de fora' not in text:
+                            fora_section['content'].append(text)
+                    current = current.find_next()
+                
+                sections.append(fora_section)
+            
+            return sections
+        
+        except Exception as e:
+            st.error(f"Erro ao extrair conteúdo da Bloomberg Línea: {str(e)}")
+            return None
+
+
+class NewsletterProcessor:
+    """Process and summarize newsletter content with AI"""
+    
+    def __init__(self):
+        self.client = None
+        self.use_ai = False
+        
+        # Initialize Groq client
+        if GROQ_API_KEY and GROQ_API_KEY != "your_groq_api_key_here":
+            try:
+                self.client = Groq(api_key=GROQ_API_KEY)
+                self.use_ai = True
+            except:
+                pass
+    
+    def sections_to_text(self, sections):
+        """Convert parsed sections to plain text for AI processing"""
+        if not sections:
+            return ""
+        
+        text_parts = []
+        for section in sections:
+            # Add section title
+            text_parts.append(f"\n## {section['title']}\n")
+            
+            # Add content based on structure
+            if isinstance(section['content'], list):
+                for item in section['content']:
+                    if isinstance(item, dict):
+                        # Has headline and text (like HIGHLIGHTS or VALE PARAR PARA LER)
+                        if 'headline' in item and 'text' in item:
+                            text_parts.append(f"**{item['headline']}**: {item['text']}")
+                        else:
+                            text_parts.append(str(item))
+                    else:
+                        text_parts.append(str(item))
+            else:
+                text_parts.append(str(section['content']))
+        
+        return "\n".join(text_parts)
+    
+    def summarize_investnews(self, sections):
+        """Summarize Investnews with AI (max 1500 chars)"""
+        if not sections:
             return None
         
-        if not self.use_ai:
-            return self.clean_text(content)
+        content = self.sections_to_text(sections)
         
-        # Determine newsletter-specific instructions
-        if "What's News" in source_name:
-            # WSJ What's News has a specific enumerated structure
-            specific_instructions = """
-ESTRUTURA ESPECÍFICA PARA WSJ WHAT'S NEWS:
-- Esta newsletter apresenta EXATAMENTE 5 tópicos principais do dia
-- Máximo 1000 caracteres no total
-- Cada tópico é numerado de 1 a 5
-- PRESERVE a numeração original e estrutura
-- Para cada tópico numerado:
-  * Inicie com o número (1., 2., 3., 4., 5.)
-  * Resuma o tema principal em 1-2 frases concisas em português
-  * Mantenha dados numéricos e nomes específicos
-  * Não misture informações de diferentes tópicos
+        if not self.use_ai:
+            return self.format_without_ai(content, 1500)
+        
+        specific_instructions = """
+ESTRUTURA ESPECÍFICA PARA INVESTNEWS:
+- Máximo 1500 caracteres no total
+- Esta newsletter tem estrutura variável com seções obrigatórias e opcionais
+- Seções obrigatórias: Primeira Notícia, HIGHLIGHTS (3 destaques), UMA IMAGEM, Segunda Notícia, VALE PARAR PARA LER
+- Seções opcionais: UM NÚMERO, UM GRÁFICO, UMA FRASE (podem ou não estar presentes)
 
 FORMATO DE SAÍDA OBRIGATÓRIO:
-1. [Resumo conciso do primeiro tópico em português]
+1. **Primeira Notícia**: Resuma a manchete principal em 2-3 frases concisas
+2. **HIGHLIGHTS**: Liste os 3 destaques principais como tópicos numerados, cada um com 1 frase
+3. **UMA IMAGEM**: Descreva brevemente o conteúdo visual em 1 frase
+4. **Segunda Notícia**: Resuma a segunda manchete em 2-3 frases
+5. Se houver **UM NÚMERO**: Mencione o dado numérico destacado em 1 frase
+6. Se houver **UM GRÁFICO**: Descreva o gráfico destacado em 1 frase
+7. Se houver **UMA FRASE**: Cite a frase destacada brevemente
+8. **VALE PARAR PARA LER**: Liste 2-3 artigos recomendados como tópicos
 
-2. [Resumo conciso do segundo tópico em português]
-
-3. [Resumo conciso do terceiro tópico em português]
-
-4. [Resumo conciso do quarto tópico em português]
-
-5. [Resumo conciso do quinto tópico em português]"""
-            max_tokens = 1000
-            temperature = 0.2  # Lower for better structure preservation
-            
-        elif "Markets AM" in source_name:
-            # WSJ Markets AM is more narrative
-            specific_instructions = """
-ESTRUTURA ESPECÍFICA PARA WSJ MARKETS AM:
-- Organize em parágrafos curtos por tema
-- Máximo 1000 caracteres no total
-- Primeira parte: principais movimentos de pré-mercado e expectativas
-- Segunda parte: dados econômicos e eventos do dia
-- Terceira parte: destaques corporativos relevantes
-- Use linguagem direta e objetiva
-- Mantenha todos os números e percentuais exatos"""
-            max_tokens = 800
-            temperature = 0.3
-            
-        elif "Markets PM" in source_name:
-            # WSJ Markets PM focuses on closing data
-            specific_instructions = """
-ESTRUTURA ESPECÍFICA PARA WSJ MARKETS PM:
-- Comece com os fechamentos dos principais índices (S&P, Dow, Nasdaq)
-- Máximo 1000 caracteres no total
-- Inclua percentuais exatos de variação
-- Mencione setores que se destacaram
-- Principais movimentos de títulos do tesouro e commodities
-- Notícias corporativas relevantes do dia
-- Use formato de parágrafos curtos e diretos"""
-            max_tokens = 800
-            temperature = 0.3
-        else:
-            specific_instructions = """
-INSTRUÇÕES GERAIS:
-- Organize em parágrafos curtos e claros
-- Use lista numerada se houver múltiplos tópicos distintos
-- Mantenha estrutura lógica por tema"""
-            max_tokens = 800
-            temperature = 0.3
+REGRAS DE FORMATAÇÃO:
+- Use **negrito** para títulos de seção
+- Use tópicos (•) para listas
+- Mantenha números e dados específicos exatos
+- Linguagem direta e objetiva
+"""
         
-        time_context = "briefing matinal para o pregão de hoje" if is_morning else "resumo pós-mercado do pregão de hoje"
+        return self.summarize_with_groq(content, "Investnews", specific_instructions, max_chars=1500)
+    
+    def summarize_exame(self, sections):
+        """Summarize Exame with AI (max 1000 chars)"""
+        if not sections:
+            return None
         
-        prompt = f"""Você é um tradutor e analista financeiro especializado em resumir newsletters de mercado mantendo FIDELIDADE TOTAL à estrutura original.
+        content = self.sections_to_text(sections)
+        
+        if not self.use_ai:
+            return self.format_without_ai(content, 1000)
+        
+        specific_instructions = """
+ESTRUTURA ESPECÍFICA PARA EXAME:
+- Máximo 1000 caracteres no total
+- Primeira notícia: Manchete principal do dia
+- Seguida por múltiplos tópicos em "O que mais você precisa saber hoje"
+- Cada tópico tem sua própria manchete e conteúdo
+
+FORMATO DE SAÍDA OBRIGATÓRIO:
+1. **Notícia Principal**: Resuma a manchete principal em 2-3 frases
+2. **Tópicos do Dia**: Liste os principais tópicos como bullets numerados:
+   • Tópico 1: [resumo em 1 frase]
+   • Tópico 2: [resumo em 1 frase]
+   • Tópico 3: [resumo em 1 frase]
+   (continue para todos os tópicos, mas seja conciso)
+
+REGRAS DE FORMATAÇÃO:
+- Use **negrito** para "Notícia Principal" e "Tópicos do Dia"
+- Use bullets (•) para cada tópico
+- Máximo 1 frase por tópico
+- Mantenha dados numéricos e nomes de empresas exatos
+"""
+        
+        return self.summarize_with_groq(content, "Exame", specific_instructions, max_chars=1000)
+    
+    def summarize_bloomberg_linea(self, sections):
+        """Summarize Bloomberg Línea with AI (max 1000 chars)"""
+        if not sections:
+            return None
+        
+        content = self.sections_to_text(sections)
+        
+        if not self.use_ai:
+            return self.format_without_ai(content, 1000)
+        
+        specific_instructions = """
+ESTRUTURA ESPECÍFICA PARA BLOOMBERG LÍNEA:
+- Máximo 1000 caracteres no total
+- Três seções principais: Notícia Principal, No Radar, Para não ficar de fora
+- No Radar contém múltiplas notícias curtas com headlines
+
+FORMATO DE SAÍDA OBRIGATÓRIO:
+1. **Notícia Principal**: Resuma a manchete de abertura em 2-3 frases
+2. **No Radar**: Liste as principais notícias como tópicos:
+   • [Headline 1]: [resumo em 1 frase]
+   • [Headline 2]: [resumo em 1 frase]
+   • [Headline 3]: [resumo em 1 frase]
+3. **Para não ficar de fora**: Resuma as notícias complementares em 1-2 frases
+
+REGRAS DE FORMATAÇÃO:
+- Use **negrito** para títulos de seção
+- Use bullets (•) para itens do No Radar
+- Mantenha headlines originais mas traduza o conteúdo
+- Priorize informações sobre mercados brasileiros e latino-americanos
+"""
+        
+        return self.summarize_with_groq(content, "Bloomberg Línea", specific_instructions, max_chars=1000)
+    
+    def summarize_with_groq(self, content, source_name, specific_instructions, max_chars=1000):
+        """Use Groq AI to summarize and translate content"""
+        if not self.use_ai or not content:
+            return self.format_without_ai(content, max_chars)
+        
+        prompt = f"""Você é um analista financeiro especializado em resumir newsletters de mercado mantendo FIDELIDADE TOTAL à estrutura original e traduzindo para português brasileiro.
 
 FONTE: {source_name}
-CONTEXTO: {time_context}
 
-CONTEÚDO ORIGINAL EM INGLÊS:
-{content[:5000]}
+CONTEÚDO ORIGINAL:
+{content[:8000]}
 
 {specific_instructions}
 
@@ -1074,8 +3297,9 @@ REGRAS CRÍTICAS DE TRADUÇÃO E FORMATAÇÃO:
 4. Preserve nomes próprios de empresas, índices e pessoas sem tradução
 5. Use terminologia financeira profissional em português (ex: "ações", "títulos", "rendimentos")
 6. Seja CONCISO mas COMPLETO - capture todas as informações essenciais
-7. Remova completamente: rodapés, prompts de assinatura, CTAs, links de newsletter
-8. Se houver enumeração no original, PRESERVE a estrutura numérica
+7. RESPEITE RIGOROSAMENTE O LIMITE DE {max_chars} CARACTERES
+8. Mantenha a estrutura de seções e formatação especificada acima
+9. Use linguagem clara e profissional adequada ao mercado financeiro brasileiro
 
 QUALIDADE DA TRADUÇÃO:
 - Priorize naturalidade e fluidez em português brasileiro
@@ -1083,14 +3307,21 @@ QUALIDADE DA TRADUÇÃO:
 - Use construções de frase idiomáticas do português
 - Contexto de mercado financeiro brasileiro
 
-Responda APENAS com o resumo traduzido e formatado, sem introduções ou comentários adicionais."""
+Responda APENAS com o resumo traduzido e formatado em HTML, sem introduções ou comentários adicionais. Use as tags HTML fornecidas abaixo para formatação:
 
+HTML FORMATTING TAGS:
+- Títulos de seção: <div style='font-size: 18px; font-weight: 700; color: #d4af37; margin: 15px 0 8px 0; font-family: Playfair Display;'>TÍTULO</div>
+- Parágrafos: <p style='margin: 6px 0; line-height: 1.6;'>texto</p>
+- Tópicos com headline: <div style='margin: 8px 0;'><strong style='color: #f4d03f;'>• Headline</strong> texto</div>
+- Negrito: <strong style='color: #f4d03f;'>texto</strong>
+"""
+        
         try:
             chat_completion = self.client.chat.completions.create(
                 messages=[
                     {
                         "role": "system",
-                        "content": "Você é um tradutor financeiro especializado que cria resumos precisos, bem estruturados e em português brasileiro fluente, mantendo fidelidade total à estrutura original do conteúdo."
+                        "content": "Você é um tradutor financeiro especializado que cria resumos precisos, bem estruturados e em português brasileiro fluente, mantendo fidelidade total à estrutura original do conteúdo. Você sempre formata suas respostas em HTML seguindo as tags especificadas."
                     },
                     {
                         "role": "user",
@@ -1098,111 +3329,34 @@ Responda APENAS com o resumo traduzido e formatado, sem introduções ou coment�
                     }
                 ],
                 model="llama-3.3-70b-versatile",
-                temperature=temperature,
-                max_tokens=max_tokens,
+                temperature=0.3,
+                max_tokens=1200,
                 top_p=0.95,
                 stream=False
             )
-            return chat_completion.choices[0].message.content.strip()
+            
+            result = chat_completion.choices[0].message.content.strip()
+            
+            # Ensure it's within character limit
+            if len(result) > max_chars * 1.2:  # Allow 20% buffer for HTML tags
+                # Truncate intelligently at last complete sentence
+                result = result[:int(max_chars * 1.2)]
+                last_period = result.rfind('</p>')
+                if last_period > max_chars * 0.8:
+                    result = result[:last_period + 4]
+            
+            return result
+            
         except Exception as e:
-            return self.clean_text(content)
+            st.warning(f"Erro ao processar com IA: {str(e)}")
+            return self.format_without_ai(content, max_chars)
     
-    def fetch_wsj_markets_am(self):
-        """Fetch WSJ Markets AM"""
-        url = "https://marketsam.createsend1.com/t/d-e-strdydt-l-r/"
-        html = self.fetch_content(url)
-        
-        if html:
-            text = self.extract_wsj_section(html, "", "Stocks I'm Watching")
-            if text:
-                summary = self.summarize_with_groq(text, "WSJ Markets AM", is_morning=True)
-                return {
-                    'source': 'WSJ Markets AM',
-                    'timestamp': self.today,
-                    'type': 'Newsletter Matinal',
-                    'content': summary,
-                    'status': 'success'
-                }
-        
-        return {
-            'source': 'WSJ Markets AM',
-            'timestamp': self.today,
-            'type': 'Newsletter Matinal',
-            'content': None,
-            'status': 'error',
-            'error': 'Falha ao buscar ou processar conteúdo'
-        }
-    
-    def fetch_wsj_whats_news(self):
-        """Fetch WSJ What's News"""
-        url = "https://whatsnews.createsend1.com/t/d-e-ekhlrg-l-r/"
-        html = self.fetch_content(url)
-        
-        if html:
-            # Extract the main content section more precisely
-            text = self.extract_wsj_section(html, "What to Watch Today", "Enjoying this newsletter?")
-            
-            # If the primary extraction didn't work, try alternative markers
-            if not text or len(text) < 200:
-                text = self.extract_wsj_section(html, "What to Watch", "Enjoying this newsletter?")
-            
-            # Additional fallback
-            if not text or len(text) < 200:
-                text = self.extract_wsj_section(html, "", "Enjoying this newsletter?")
-            
-            if text:
-                summary = self.summarize_with_groq(text, "WSJ What's News", is_morning=True)
-                return {
-                    'source': "WSJ What's News",
-                    'timestamp': self.today,
-                    'type': 'Newsletter Matinal',
-                    'content': summary,
-                    'status': 'success'
-                }
-        
-        return {
-            'source': "WSJ What's News",
-            'timestamp': self.today,
-            'type': 'Newsletter Matinal',
-            'content': None,
-            'status': 'error',
-            'error': 'Falha ao buscar ou processar conteúdo'
-        }
-    
-    def fetch_wsj_markets_pm(self):
-        """Fetch WSJ Markets PM"""
-        url = "https://marketspm.createsend1.com/t/d-e-styltdt-l-r/"
-        html = self.fetch_content(url)
-        
-        if html:
-            text = self.extract_wsj_section(html, "What Happened in Markets Today", "CONTENT FROM:")
-            if text:
-                summary = self.summarize_with_groq(text, "WSJ Markets PM", is_morning=False)
-                return {
-                    'source': 'WSJ Markets PM',
-                    'timestamp': self.yesterday,
-                    'type': 'Newsletter Pós-Mercado',
-                    'content': summary,
-                    'status': 'success'
-                }
-        
-        return {
-            'source': 'WSJ Markets PM',
-            'timestamp': self.yesterday,
-            'type': 'Newsletter Pós-Mercado',
-            'content': None,
-            'status': 'error',
-            'error': 'Falha ao buscar ou processar conteúdo'
-        }
-    
-    def fetch_all_newsletters(self):
-        """Fetch all newsletters"""
-        newsletters = {
-            'wsj_markets_am': self.fetch_wsj_markets_am(),
-            'wsj_whats_news': self.fetch_wsj_whats_news(),
-            'wsj_markets_pm': self.fetch_wsj_markets_pm()
-        }
-        return newsletters
+    def format_without_ai(self, content, max_chars):
+        """Fallback formatting without AI"""
+        # Simple truncation with HTML formatting
+        clean_content = content[:max_chars]
+        return f"<p style='margin: 6px 0; line-height: 1.6;'>{clean_content}</p>"
+
 
 def display_newsletter_card(newsletter_data):
     """Display a newsletter in a card format using Streamlit containers"""
@@ -1247,22 +3401,98 @@ def display_newsletter_card(newsletter_data):
         # Divider
         st.markdown("<div style='border-top: 1px solid #333; margin: 30px 0;'></div>", unsafe_allow_html=True)
 
+
 # Initialize newsletter session state
 if 'newsletters_data' not in st.session_state:
     st.session_state.newsletters_data = {}
 if 'last_news_refresh' not in st.session_state:
     st.session_state.last_news_refresh = None
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUPABASE HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SupabaseNewsletter:
+    """Helper class for Supabase newsletter operations"""
+    
+    def __init__(self):
+        self.url = SUPABASE_URL
+        self.key = SUPABASE_KEY
+        self.headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json"
+        }
+        self.table_name = "newsletters"
+    
+    def save_newsletter(self, newsletter_type, content, source_name):
+        """Save or update newsletter in Supabase"""
+        if not self.url or not self.key:
+            return False
+        
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            
+            data = {
+                "newsletter_type": newsletter_type,
+                "content": content,
+                "source_name": source_name,
+                "upload_date": today,
+                "created_at": datetime.now().isoformat()
+            }
+            
+            # First, try to delete existing newsletter of same type for today
+            delete_url = f"{self.url}/rest/v1/{self.table_name}?newsletter_type=eq.{newsletter_type}&upload_date=eq.{today}"
+            requests.delete(delete_url, headers=self.headers)
+            
+            # Insert new newsletter
+            insert_url = f"{self.url}/rest/v1/{self.table_name}"
+            response = requests.post(insert_url, headers=self.headers, json=data)
+            
+            return response.status_code in [200, 201]
+        except Exception as e:
+            st.error(f"Erro ao salvar no Supabase: {str(e)}")
+            return False
+    
+    def get_todays_newsletters(self):
+        """Get all newsletters for today"""
+        if not self.url or not self.key:
+            return {}
+        
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            url = f"{self.url}/rest/v1/{self.table_name}?upload_date=eq.{today}"
+            
+            response = requests.get(url, headers=self.headers)
+            
+            if response.status_code == 200:
+                newsletters = response.json()
+                result = {}
+                for newsletter in newsletters:
+                    result[newsletter['newsletter_type']] = {
+                        'source': newsletter['source_name'],
+                        'timestamp': newsletter['upload_date'],
+                        'type': 'Newsletter Upload',
+                        'content': newsletter['content'],
+                        'status': 'success'
+                    }
+                return result
+            else:
+                return {}
+        except Exception as e:
+            return {}
+
+
 def show_dashboard():
     st.title("📈 Painel de Índices de Mercado")
     
     # Create tabs
-    tab1, tab2, tab3 = st.tabs(["Análise de Índices", "Tesouro Direto", "Notícias de Mercado"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Análise de Índices", "Curvas de Juros", "Curvas de Crédito", "Tesouro Direto", "Noticiário Renda Fixa"])
     
     # ═══════════════════════════════════════════════════════════════════════════
     # TAB 1: ANÁLISE DE ÍNDICES
     # ═══════════════════════════════════════════════════════════════════════════
-    
     with tab1:
         indices_data = load_all_indices()
         
@@ -1576,6 +3806,12 @@ def show_dashboard():
                         html_table += '</td>'
                     else:
                         html_table += '<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a;">-</td>'
+
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TAB 2: TESOURO DIRETO
+    # ═══════════════════════════════════════════════════════════════════════════
+                        html_table += '<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a;">-</td>'
                 
                 html_table += '</tr>'
             
@@ -1594,7 +3830,535 @@ def show_dashboard():
     # TAB 2: TESOURO DIRETO
     # ═══════════════════════════════════════════════════════════════════════════
     
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 2: CURVAS ANBIMA (from news_v5.py)
+    # ═══════════════════════════════════════════════════════════════════════
+    
     with tab2:
+        st.header("📈 Análise de Curvas ANBIMA")
+        
+        # Check if user is admin
+        is_admin = st.session_state.get('user_logged_in') == 'admin'
+        
+        # Initialize Supabase client
+        supabase_client = init_supabase_client()
+        
+        
+        # Admin upload section
+        if is_admin:
+            st.markdown("### 🔐 Área do Administrador")
+            
+            uploaded_excel = st.file_uploader(
+                "Upload arquivo Excel com curvas ANBIMA",
+                type=['xlsx', 'xls'],
+                key='curves_excel',
+                help="Arquivo deve conter 3 sheets: 'ETTJ PRE', 'ETTJ IPCA', 'Inflação Implícita'"
+            )
+            
+            if uploaded_excel:
+                if st.button("💾 Salvar Curvas no Banco", type="primary"):
+                    with st.spinner("Processando e salvando..."):
+                        json_data = process_excel_to_json(uploaded_excel)
+                        if json_data and supabase_client:
+                            if save_curves_to_database(supabase_client, json_data):
+                                st.success("✅ Curvas salvas com sucesso!")
+                                # Clear cache so new data is loaded
+                                st.session_state.curves_data_cache = None
+                                st.rerun()
+                            else:
+                                st.error("❌ Erro ao salvar curvas")
+                        elif not supabase_client:
+                            st.error("❌ Cliente Supabase não inicializado")
+            
+            st.markdown("---")
+            
+            # Add refresh button for admin
+            if st.button("🔄 Recarregar Dados do Banco", use_container_width=True):
+                st.session_state.curves_data_cache = None
+                st.success("✅ Cache limpo! Dados serão recarregados.")
+                st.rerun()
+        
+        # Load curves data (use session state to avoid reloading on every button click)
+        if 'curves_data_cache' not in st.session_state:
+            st.session_state.curves_data_cache = None
+        
+        # Only load from database if not in cache
+        if st.session_state.curves_data_cache is None:
+            if supabase_client:
+                try:
+                    curves_data = load_curves_from_database(supabase_client)
+                    if curves_data:
+                        st.session_state.curves_data_cache = curves_data
+                except Exception as e:
+                    st.error(f"Erro ao carregar dados: {e}")
+                    curves_data = None
+            else:
+                curves_data = None
+        else:
+            curves_data = st.session_state.curves_data_cache
+        
+        if not curves_data:
+            st.warning("⚠️ Nenhuma curva disponível.")
+            if not is_admin:
+                st.info("💡 Aguardando upload do administrador.")
+        else:
+            # Convert JSON to DataFrames
+            dataframes = json_to_dataframes(curves_data)
+            
+            if dataframes:
+                # Buttons to select curve
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    if st.button("ETTJ IPCA", use_container_width=True, key="btn_ipca"):
+                        st.session_state.selected_curve = 'ETTJ IPCA'
+                
+                with col2:
+                    if st.button("ETTJ PRE", use_container_width=True, key="btn_pre"):
+                        st.session_state.selected_curve = 'ETTJ PRE'
+                
+                with col3:
+                    if st.button("Inflação Implícita", use_container_width=True, key="btn_inflacao"):
+                        st.session_state.selected_curve = 'Inflação Implícita'
+                
+                # Initialize selected curve
+                if 'selected_curve' not in st.session_state:
+                    st.session_state.selected_curve = 'ETTJ IPCA'
+                
+                selected_curve = st.session_state.selected_curve
+                
+                st.subheader(f"Curva Selecionada: {selected_curve}")
+                
+                # Get selected DataFrame
+                df = dataframes.get(selected_curve)
+                
+                if df is not None:
+                    # 1. Display curve chart
+                    st.markdown("### 📊 Gráfico da Curva")
+                    fig = create_curves_chart(df, selected_curve)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    # 2. Calculate and display rate variations
+                    st.markdown("### 📉 Variações de Taxas (10 maiores em ordem)")
+                    
+                    variations = calculate_curves_variations(df)
+                    
+                    if variations:
+                        cols = st.columns(min(5, len(variations)))
+                        
+                        for i, (days_back, var_list) in enumerate(sorted(variations.items())):
+                            if i < len(cols):
+                                with cols[i]:
+                                    st.markdown(f"#### Variação de {days_back} Dia{'s' if days_back > 1 else ''}")
+                                    
+                                    html_table = '<table style="width:100%; border-collapse: collapse; font-size: 12px;">'
+                                    html_table += '<thead><tr style="background-color: #0a0a0a;">'
+                                    html_table += '<th style="border: 1px solid #d4af37; padding: 8px; color: #d4af37;">Vértice</th>'
+                                    html_table += '<th style="border: 1px solid #d4af37; padding: 8px; color: #d4af37;">Variação (p.p.)</th>'
+                                    html_table += '</tr></thead><tbody>'
+                                    
+                                    for vertex, variation in var_list:
+                                        color = "#00e100" if variation >= 0 else "#f20000"
+                                        arrow = '▲' if variation >= 0 else '▼'
+                                        
+                                        html_table += '<tr>'
+                                        html_table += f'<td style="border: 1px solid #333; padding: 6px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{vertex:.2f}</td>'
+                                        html_table += f'<td style="border: 1px solid #333; padding: 6px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {abs(variation):.4f}%</td>'
+                                        html_table += '</tr>'
+                                    
+                                    html_table += '</tbody></table>'
+                                    st.markdown(html_table, unsafe_allow_html=True)
+                    
+                    # 3. Display rates table
+                    st.markdown(f"### 📋 Tabela de Taxas - {selected_curve}")
+                    
+                    rates_table = create_curves_table(df, selected_curve)
+                    if rates_table is not None:
+                        st.dataframe(rates_table, use_container_width=True, height=400)
+                    
+                    # 4. Two-day comparison
+                    st.markdown("### 🔄 Comparação Entre Dois Dias")
+                    
+                    date_columns = df.columns[1:].tolist()
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        date1 = st.selectbox(
+                            "Selecione o Dia Mais Antigo",
+                            options=date_columns,
+                            index=0,
+                            key='comparison_date1'
+                        )
+                    
+                    with col2:
+                        date2 = st.selectbox(
+                            "Selecione o Dia Mais Recente",
+                            options=date_columns,
+                            index=len(date_columns) - 1,
+                            key='comparison_date2'
+                        )
+                    
+                    if st.button("Gerar Comparação", use_container_width=False):
+                        vertices = df.iloc[:, 0].values
+                        rates1 = df[date1].values
+                        rates2 = df[date2].values
+                        
+                        st.markdown(f"#### Comparação: {date1} vs {date2}")
+                        
+                        html_table = '<table style="width:100%; border-collapse: collapse; font-size: 13px;">'
+                        html_table += '<thead><tr style="background-color: #0a0a0a;">'
+                        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Vértice (Anos)</th>'
+                        html_table += f'<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">{date1}</th>'
+                        html_table += f'<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">{date2}</th>'
+                        html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Variação (p.p.)</th>'
+                        html_table += '</tr></thead><tbody>'
+                        
+                        for i, vertex in enumerate(vertices):
+                            if pd.notna(rates1[i]) and pd.notna(rates2[i]):
+                                rate1 = rates1[i]
+                                rate2 = rates2[i]
+                                variation = rate2 - rate1
+                                
+                                color = '#00e100' if variation >= 0 else "#f20000"
+                                arrow = '▲' if variation >= 0 else '▼'
+                                
+                                html_table += '<tr>'
+                                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37; font-weight: bold;">{vertex:.2f}</td>'
+                                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: #d4af37;">{rate1:.4f}%</td>'
+                                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: #d4af37;">{rate2:.4f}%</td>'
+                                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {abs(variation):.4f}%</td>'
+                                html_table += '</tr>'
+                        
+                        html_table += '</tbody></table>'
+                        st.markdown(html_table, unsafe_allow_html=True)
+                        
+                        # Summary statistics
+                        st.markdown("#### Estatísticas da Comparação")
+                        valid_variations = [rates2[i] - rates1[i] for i in range(len(vertices)) 
+                                          if pd.notna(rates1[i]) and pd.notna(rates2[i])]
+                        
+                        if valid_variations:
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Variação Média", f"{sum(valid_variations)/len(valid_variations):.4f}%")
+                            with col2:
+                                st.metric("Variação Máxima", f"{max(valid_variations):.4f}%")
+                            with col3:
+                                st.metric("Variação Mínima", f"{min(valid_variations):.4f}%")
+
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # TAB 3: CURVAS DE CRÉDITO
+    # ═══════════════════════════════════════════════════════════════════════════════
+    with tab3:
+        st.header("📊 Análise de Curvas de Crédito")
+        
+        # Check if user is admin
+        is_admin = st.session_state.get('user_logged_in') == 'admin'
+        
+        # Initialize Supabase client
+        supabase_client = init_supabase_client()
+        
+        # Admin upload section
+        if is_admin:
+            st.markdown("### 🔐 Área do Administrador")
+            
+            uploaded_excel = st.file_uploader(
+                "Upload arquivo Excel com curvas de crédito",
+                type=['xlsx', 'xls'],
+                key='credit_curves_excel',
+                help="Arquivo deve conter 3 sheets: 'AAA', 'AA', 'A'"
+            )
+            
+            if uploaded_excel:
+                if st.button("💾 Salvar Curvas de Crédito no Banco", type="primary"):
+                    with st.spinner("Processando e salvando..."):
+                        json_data = process_credit_excel_to_json(uploaded_excel)
+                        if json_data and supabase_client:
+                            if save_credit_curves_to_database(supabase_client, json_data):
+                                st.success("✅ Curvas de crédito salvas com sucesso!")
+                                # Clear cache
+                                st.session_state.credit_curves_data_cache = None
+                                st.rerun()
+                            else:
+                                st.error("❌ Erro ao salvar curvas de crédito")
+                        elif not supabase_client:
+                            st.error("❌ Cliente Supabase não inicializado")
+            
+            st.markdown("---")
+            
+            # Add refresh button for admin
+            if st.button("🔄 Recarregar Dados de Crédito do Banco", use_container_width=True):
+                st.session_state.credit_curves_data_cache = None
+                st.success("✅ Cache limpo! Dados serão recarregados.")
+                st.rerun()
+        
+        # Load credit curves data (use session state to avoid reloading)
+        if 'credit_curves_data_cache' not in st.session_state:
+            st.session_state.credit_curves_data_cache = None
+        
+        # Only load from database if not in cache
+        if st.session_state.credit_curves_data_cache is None:
+            if supabase_client:
+                try:
+                    credit_curves_data = load_credit_curves_from_database(supabase_client)
+                    if credit_curves_data:
+                        st.session_state.credit_curves_data_cache = credit_curves_data
+                except Exception as e:
+                    st.error(f"Erro ao carregar dados: {e}")
+                    credit_curves_data = None
+            else:
+                credit_curves_data = None
+        else:
+            credit_curves_data = st.session_state.credit_curves_data_cache
+        
+        if not credit_curves_data:
+            st.warning("⚠️ Nenhuma curva de crédito disponível.")
+            if not is_admin:
+                st.info("💡 Aguardando upload do administrador.")
+        else:
+            # Convert JSON to DataFrames
+            dataframes = json_to_dataframes(credit_curves_data)
+            
+            if dataframes:
+                # Get available dates from any dataframe
+                sample_df = list(dataframes.values())[0]
+                available_dates = sample_df.columns[1:].tolist() if sample_df is not None else []
+                
+                # Create 4 main buttons
+                st.markdown("### 📊 Visualização de Dados")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    if st.button("Comparativo", use_container_width=True, key="btn_credit_comp"):
+                        st.session_state.credit_view = 'comparativo'
+                
+                with col2:
+                    if st.button("AAA", use_container_width=True, key="btn_credit_aaa"):
+                        st.session_state.credit_view = 'AAA'
+                
+                with col3:
+                    if st.button("AA", use_container_width=True, key="btn_credit_aa"):
+                        st.session_state.credit_view = 'AA'
+                
+                with col4:
+                    if st.button("A", use_container_width=True, key="btn_credit_a"):
+                        st.session_state.credit_view = 'A'
+                
+                # Initialize view
+                if 'credit_view' not in st.session_state:
+                    st.session_state.credit_view = 'comparativo'
+                
+                st.markdown("---")
+                
+                # ═══════════════════════════════════════════════════════════════
+                # SECTION 1: COMPARATIVO
+                # ═══════════════════════════════════════════════════════════════
+                if st.session_state.credit_view == 'comparativo':
+                    st.subheader("📊 Comparativo de Ratings")
+                    
+                    # Date selector
+                    selected_date = st.selectbox(
+                        "Selecione o Dia de Referência",
+                        options=available_dates,
+                        index=len(available_dates) - 1,  # Default to latest
+                        key='credit_comp_date'
+                    )
+                    
+                    # Chart
+                    fig = create_credit_comparison_chart(dataframes, selected_date)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    # ═══════════════════════════════════════════════════════════
+                    # ═══════════════════════════════════════════════════════════
+                    # ═══════════════════════════════════════════════════════════
+                    # SPREAD DIFFERENCES SECTION
+                    # ═══════════════════════════════════════════════════════════
+                    st.markdown("### 📉 Diferença de Spreads entre Ratings")
+                    st.markdown("*Média da diferença em p.p. (rating menor - rating maior)*")
+                    
+                    # Calculate all spread differences
+                    rating_pairs = [('A', 'AAA'), ('A', 'AA'), ('AA', 'AAA')]
+                    
+                    # Create data for table
+                    table_data = []
+                    for rating_lower, rating_higher in rating_pairs:
+                        row = {
+                            'Comparação': f'{rating_lower} - {rating_higher}'
+                        }
+                        for date in available_dates[:6]:
+                            avg_diff = calculate_spread_differences(
+                                dataframes, rating_lower, rating_higher, date
+                            )
+                            if avg_diff is not None:
+                                row[date] = f'{avg_diff:.4f}%'
+                            else:
+                                row[date] = '-'
+                        table_data.append(row)
+                    
+                    # Create styled HTML table
+                    html_table = '<table style="width:100%; border-collapse: collapse; font-size: 14px; margin: 20px 0;">'
+                    
+                    # Header
+                    html_table += '<thead><tr style="background-color: #0a0a0a;">'
+                    html_table += '<th style="border: 2px solid #d4af37; padding: 12px; color: #d4af37; text-align: center; font-weight: bold;">Comparação</th>'
+                    for date in available_dates[:6]:
+                        html_table += f'<th style="border: 2px solid #d4af37; padding: 12px; color: #d4af37; text-align: center; font-weight: bold;">{date}</th>'
+                    html_table += '</tr></thead>'
+                    
+                    # Body
+                    html_table += '<tbody>'
+                    for row_data in table_data:
+                        html_table += '<tr>'
+                        html_table += f'<td style="border: 1px solid #d4af37; padding: 12px; text-align: center; background-color: #1a1a1a; color: #d4af37; font-weight: bold;">{row_data["Comparação"]}</td>'
+                        for date in available_dates[:6]:
+                            value = row_data.get(date, '-')
+                            html_table += f'<td style="border: 1px solid #333; padding: 12px; text-align: center; background-color: #1a1a1a; color: #d4af37; font-size: 16px;">{value}</td>'
+                        html_table += '</tr>'
+                    html_table += '</tbody></table>'
+                    
+                    st.markdown(html_table, unsafe_allow_html=True)
+                
+                # SECTIONS 2-4: INDIVIDUAL RATINGS (AAA, AA, A)
+                # ═══════════════════════════════════════════════════════════════
+                elif st.session_state.credit_view in ['AAA', 'AA', 'A']:
+                    rating = st.session_state.credit_view
+                    df = dataframes.get(rating)
+                    
+                    if df is not None:
+                        st.subheader(f"Rating {rating}")
+                        
+                        # 1. Display curve chart
+                        st.markdown("### 📊 Gráfico de Spreads")
+                        fig = create_credit_curves_chart(df, rating)
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        # 2. Calculate and display rate variations
+                        st.markdown("### 📉 Variações de Spreads")
+                        
+                        variations = calculate_credit_variations(df)
+                        
+                        if variations:
+                            cols = st.columns(min(5, len(variations)))
+                            
+                            for i, (days_back, var_list) in enumerate(sorted(variations.items())):
+                                if i < len(cols):
+                                    with cols[i]:
+                                        st.markdown(f"#### Variação de {days_back} Dia{'s' if days_back > 1 else ''}")
+                                        
+                                        html_table = '<table style="width:100%; border-collapse: collapse; font-size: 12px;">'
+                                        html_table += '<thead><tr style="background-color: #0a0a0a;">'
+                                        html_table += '<th style="border: 1px solid #d4af37; padding: 8px; color: #d4af37;">Vértice</th>'
+                                        html_table += '<th style="border: 1px solid #d4af37; padding: 8px; color: #d4af37;">Variação (p.p.)</th>'
+                                        html_table += '</tr></thead><tbody>'
+                                        
+                                        for vertex, variation in var_list:
+                                            color = "#00e100" if variation >= 0 else "#f20000"
+                                            arrow = '▲' if variation >= 0 else '▼'
+                                            
+                                            html_table += '<tr>'
+                                            html_table += f'<td style="border: 1px solid #333; padding: 6px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{vertex:.2f}</td>'
+                                            html_table += f'<td style="border: 1px solid #333; padding: 6px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {abs(variation):.4f}%</td>'
+                                            html_table += '</tr>'
+                                        
+                                        html_table += '</tbody></table>'
+                                        st.markdown(html_table, unsafe_allow_html=True)
+                        
+                        # 3. Display rates table
+                        st.markdown(f"### 📋 Tabela de Spreads - {rating}")
+                        
+                        rates_table = create_credit_table(df)
+                        if rates_table is not None:
+                            st.dataframe(rates_table, use_container_width=True, height=400)
+                        
+                        # 4. Two-day comparison
+                        st.markdown("### 🔄 Comparação Entre Dois Dias")
+                        
+                        date_columns = df.columns[1:].tolist()
+                        
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            date1 = st.selectbox(
+                                "Selecione o Dia Mais Antigo",
+                                options=date_columns,
+                                index=0,
+                                key=f'credit_comparison_date1_{rating}'
+                            )
+                        
+                        with col2:
+                            date2 = st.selectbox(
+                                "Selecione o Dia Mais Recente",
+                                options=date_columns,
+                                index=len(date_columns) - 1,
+                                key=f'credit_comparison_date2_{rating}'
+                            )
+                        
+                        if st.button("Gerar Comparação", use_container_width=False, key=f'credit_gen_comp_{rating}'):
+                            vertices = df.iloc[:, 0].values
+                            rates1 = df[date1].values
+                            rates2 = df[date2].values
+                            
+                            st.markdown(f"#### Comparação: {date1} vs {date2}")
+                            
+                            html_table = '<table style="width:100%; border-collapse: collapse; font-size: 13px;">'
+                            html_table += '<thead><tr style="background-color: #0a0a0a;">'
+                            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Vértice (Anos)</th>'
+                            html_table += f'<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">{date1}</th>'
+                            html_table += f'<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">{date2}</th>'
+                            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Variação (p.p.)</th>'
+                            html_table += '</tr></thead><tbody>'
+                            
+                            for i, vertex in enumerate(vertices):
+                                if pd.notna(rates1[i]) and pd.notna(rates2[i]):
+                                    rate1 = rates1[i]
+                                    rate2 = rates2[i]
+                                    variation = rate2 - rate1
+                                    
+                                    color = '#00e100' if variation >= 0 else "#f20000"
+                                    arrow = '▲' if variation >= 0 else '▼'
+                                    
+                                    html_table += '<tr>'
+                                    html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37; font-weight: bold;">{vertex:.2f}</td>'
+                                    html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: #d4af37;">{rate1:.4f}%</td>'
+                                    html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: #d4af37;">{rate2:.4f}%</td>'
+                                    html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {abs(variation):.4f}%</td>'
+                                    html_table += '</tr>'
+                            
+                            html_table += '</tbody></table>'
+                            st.markdown(html_table, unsafe_allow_html=True)
+                            
+                            # Summary statistics
+                            st.markdown("#### Estatísticas da Comparação")
+                            valid_variations = [rates2[i] - rates1[i] for i in range(len(vertices)) 
+                                              if pd.notna(rates1[i]) and pd.notna(rates2[i])]
+                            
+                            if valid_variations:
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("Variação Média", f"{sum(valid_variations)/len(valid_variations):.4f}%")
+                                with col2:
+                                    st.metric("Variação Máxima", f"{max(valid_variations):.4f}%")
+                                with col3:
+                                    st.metric("Variação Mínima", f"{min(valid_variations):.4f}%")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TAB 3: NOTÍCIAS DE MERCADO
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # TAB 4: NEWSLETTERS (from news_v5.py)
+    # ═══════════════════════════════════════════════════════════════════════
+    
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TAB 4: TESOURO DIRETO
+    # ═══════════════════════════════════════════════════════════════════════════
+    with tab4:
         st.header("💰 Análise de Taxas do Tesouro Direto")
         
         # Load Tesouro Direto data
@@ -1863,93 +4627,106 @@ def show_dashboard():
         else:
             st.error("Não foi possível carregar os dados do Tesouro Direto. Verifique sua conexão.")
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # TAB 3: NOTÍCIAS DE MERCADO (NEWS AGGREGATOR)
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    with tab3:
-        st.header("📰 Agregador de Notícias Financeiras")
+    with tab5:
+        st.markdown("### 📰 Noticiário Renda Fixa")
         
-        # Check if API key is configured
-        api_key_configured = GROQ_API_KEY != "your_groq_api_key_here"
+        # Initialize Supabase client
+        supabase_client = init_supabase_client()
         
-        if not api_key_configured:
-            st.error("⚠️ Por favor configure a chave API Groq no código!")
-            st.info("Obtenha sua chave API GRATUITA em: https://console.groq.com")
-            st.markdown("""
-            **Como configurar:**
-            1. Edite o arquivo Python
-            2. Procure por `GROQ_API_KEY = "your_groq_api_key_here"`
-            3. Substitua pela sua chave (começa com `gsk_`)
-            4. Salve e reinicie o app
-            """)
-        else:
-            # Control panel
-            col1, col2, col3 = st.columns([2, 2, 1])
+        # Check if user is admin
+        is_admin = st.session_state.get('user_logged_in') == 'admin'
+        
+        # Try to load saved data from database first
+        saved_data = None
+        if supabase_client:
+            saved_data = load_noticiario_from_database(supabase_client)
+        
+        # Admin section - upload and save
+        if is_admin:
+            st.markdown("#### 🔐 Admin: Upload e Salvar Novo Noticiário")
             
-            with col1:
-                if st.button("🔄 Atualizar Notícias", use_container_width=True, key="news_refresh"):
-                    with st.spinner("Buscando e processando newsletters..."):
-                        aggregator = NewsletterAggregator()
-                        st.session_state.newsletters_data = aggregator.fetch_all_newsletters()
-                        st.session_state.last_news_refresh = datetime.now()
-                        st.success("✅ Notícias atualizadas!")
-                        st.rerun()
+            uploaded_file = st.file_uploader(
+                "Escolha o arquivo HTML",
+                type=['html', 'htm'],
+                help="Arquivo HTML do noticiário semanal de renda fixa",
+                key='admin_upload'
+            )
             
-            with col2:
-                if st.session_state.last_news_refresh:
-                    st.info(f"Última atualização: {st.session_state.last_news_refresh.strftime('%H:%M:%S')}")
-                else:
-                    st.info("Clique em 'Atualizar Notícias' para carregar")
+            if uploaded_file is not None:
+                try:
+                    # Read HTML content
+                    html_content = uploaded_file.read().decode('utf-8')
+                    
+                    # Parse the content
+                    with st.spinner("📖 Processando o noticiário..."):
+                        daily_reports = parse_noticiario_renda_fixa(html_content)
+                    
+                    if daily_reports:
+                        st.success(f"✅ {len(daily_reports)} dia(s) de notícias encontrado(s)!")
+                        
+                        # Save to database button
+                        if supabase_client:
+                            if st.button("💾 Salvar no Banco de Dados (Substituir Anterior)", type="primary"):
+                                with st.spinner("Salvando..."):
+                                    if save_noticiario_to_database(supabase_client, html_content, daily_reports, "admin"):
+                                        st.success("✅ Noticiário salvo com sucesso! Todos os usuários verão esta versão.")
+                                        # Force reload
+                                        st.rerun()
+                                    else:
+                                        st.error("❌ Erro ao salvar no banco de dados.")
+                        
+                        # Display the reports
+                        st.markdown("---")
+                        st.markdown("#### Preview:")
+                        display_noticiario_renda_fixa(daily_reports)
+                    else:
+                        st.warning("⚠️ Nenhuma notícia foi encontrada no arquivo. Verifique o formato.")
+                        
+                except Exception as e:
+                    st.error(f"❌ Erro ao processar o arquivo: {str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
             
             st.markdown("---")
+        
+        # Display section - show saved data or instructions
+        if saved_data:
+            # Show when it was uploaded
+            upload_date = saved_data.get('upload_date', '')
+            if upload_date:
+                upload_datetime = datetime.fromisoformat(upload_date)
+                formatted_date = upload_datetime.strftime("%d/%m/%Y às %H:%M")
+                st.info(f"📅 Última atualização: {formatted_date}")
             
-            # Load newsletters on first access if not already loaded
-            if not st.session_state.newsletters_data:
-                with st.spinner("Carregando newsletters pela primeira vez..."):
-                    aggregator = NewsletterAggregator()
-                    st.session_state.newsletters_data = aggregator.fetch_all_newsletters()
-                    st.session_state.last_news_refresh = datetime.now()
-            
-            # Display newsletters
-            newsletters = st.session_state.newsletters_data
-            
-            if newsletters:
-                # Morning Section
-                st.markdown("### 🌅 Relatórios Matinais")
-                st.markdown("*Análise pré-mercado e perspectivas para hoje*")
-                
-                morning_newsletters = [
-                    newsletters.get('wsj_markets_am'),
-                    newsletters.get('wsj_whats_news')
-                ]
-                
-                for newsletter in morning_newsletters:
-                    if newsletter:
-                        display_newsletter_card(newsletter)
-                
-                # After-market Section
-                st.markdown("---")
-                st.markdown("### 🌆 Relatórios Pós-Mercado")
-                st.markdown("*Resumo do fechamento e análise*")
-                
-                afternoon_newsletters = [
-                    newsletters.get('wsj_markets_pm')
-                ]
-                
-                for newsletter in afternoon_newsletters:
-                    if newsletter:
-                        display_newsletter_card(newsletter)
-                
-                st.markdown("---")
-                st.markdown(
-                    "<p style='text-align: center; color: #d4af37; font-family: Montserrat;'>Powered by Groq (Llama 3.3 70B) | Fonte: Wall Street Journal</p>",
-                    unsafe_allow_html=True
-                )
+            # Display the saved reports
+            parsed_data = saved_data.get('parsed_data', [])
+            if parsed_data:
+                display_noticiario_renda_fixa(parsed_data)
             else:
-                st.warning("Clique em 'Atualizar Notícias' para carregar as newsletters.")
+                st.warning("⚠️ Dados salvos não puderam ser exibidos.")
+        else:
+            # No saved data - show instructions
+            if not is_admin:
+                st.info("""
+                **Aguardando primeiro upload**
+                
+                O administrador ainda não fez upload do noticiário semanal.
+                Assim que disponível, as notícias aparecerão aqui automaticamente.
+                """)
+            else:
+                st.info("""
+                **Como usar:**
+                1. Faça upload do arquivo HTML do noticiário semanal
+                2. O sistema irá extrair automaticamente as notícias organizadas por dia
+                3. Clique em "Salvar no Banco de Dados" para disponibilizar para todos os usuários
+                4. Cada dia terá as seguintes seções:
+                   - 📊 **Leitura da Curva**: Análise dos juros futuros
+                   - 🌍 **Mercados Globais**: Notícias internacionais
+                   - 🇧🇷 **Mercado Doméstico**: Notícias do Brasil
+                   - 📰 **Noticiário Corporativo**: Notícias por setor
+                """)
+    
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN APP LOGIC
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1957,4 +4734,3 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
-
