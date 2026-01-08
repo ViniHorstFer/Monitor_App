@@ -4696,7 +4696,6 @@ def show_dashboard():
             if upload_date:
                 upload_datetime = datetime.fromisoformat(upload_date)
                 formatted_date = upload_datetime.strftime("%d/%m/%Y às %H:%M")
-                st.info(f"📅 Última atualização: {formatted_date}")
             
             # Display the saved reports
             parsed_data = saved_data.get('parsed_data', [])
@@ -4734,6 +4733,7 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
 
 
 
