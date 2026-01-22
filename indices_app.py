@@ -909,11 +909,9 @@ def show_landing_page():
     
     with col2:
         st.markdown('<div class="login-container">', unsafe_allow_html=True)
-        st.markdown('<p class="login-title">INDICES ANALYTICS</p>', unsafe_allow_html=True)
-        st.markdown('<p style="color: #888888; text-align: center; margin-bottom: 20px;">Please sign in to continue</p>', unsafe_allow_html=True)
         
-        username_input = st.text_input("Username", key="login_username_input")
-        password_input = st.text_input("Password", type="password", key="login_password_input")
+        username_input = st.text_input("Usuário", key="login_username_input", placeholder="Digite seu usuário")
+        password_input = st.text_input("Senha", type="password", key="login_password_input", placeholder="Digite sua senha")
         
         col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
         with col_btn2:
@@ -968,6 +966,7 @@ except ImportError:
 def init_supabase_client():
     """Initialize Supabase client (optional)"""
     if not SUPABASE_AVAILABLE:
+        st.error("❌ DEBUG: Supabase library not available (import failed)")
         return None
     
     # Use the variables loaded from st.secrets at the top of the file
@@ -982,7 +981,9 @@ def init_supabase_client():
         client = create_client(supabase_url, supabase_key)
         return client
     except Exception as e:
-        st.warning(f"⚠️ Could not connect to Supabase: {e}")
+        st.error(f"❌ DEBUG: Could not connect to Supabase: {e}")
+        import traceback
+        st.error(traceback.format_exc())
         return None
 
 
@@ -2247,7 +2248,7 @@ def display_noticiario_renda_fixa(daily_reports):
             if report['sections']['mercado_domestico']['items']:
                 st.markdown(f"""
                     <div class="section-box">
-                        <div class="section-title">📍 {report['sections']['mercado_domestico']['title']}</div>
+                        <div class="section-title">🇧🇷 {report['sections']['mercado_domestico']['title']}</div>
                 """, unsafe_allow_html=True)
                 
                 for item in report['sections']['mercado_domestico']['items']:
@@ -2330,58 +2331,32 @@ def check_admin_access():
     """Check if user has admin access based on logged in user"""
     return st.session_state.get('user_logged_in') == 'admin' 
 
-def save_curves_to_database(supabase_client, file_data, uploaded_by="admin"):
-    """Save curves data to Supabase"""
+def download_curves_from_github():
+    """Download curvas.xlsx from GitHub Release"""
     try:
-        data = {
-            'upload_date': datetime.now().isoformat(),
-            'uploaded_by': uploaded_by,
-            'file_data': file_data
-        }
+        url = "https://github.com/ViniHorstFer/Monitor_App/releases/download/data/curvas.xlsx"
+        response = requests.get(url, timeout=30)
         
-        # Delete old records (keep only latest)
-        supabase_client.table('anbima_curves').delete().neq('id', 0).execute()
-        
-        # Insert new record
-        result = supabase_client.table('anbima_curves').insert(data).execute()
-        
-        return True
+        if response.status_code == 200:
+            # Convert to JSON format
+            excel_file = BytesIO(response.content)
+            xl_file = pd.ExcelFile(excel_file)
+            
+            data = {}
+            for sheet_name in xl_file.sheet_names:
+                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                data[sheet_name] = {
+                    'columns': df.columns.tolist(),
+                    'data': df.to_dict('list')
+                }
+            
+            return data
+        else:
+            st.error(f"❌ Erro ao baixar curvas.xlsx: HTTP {response.status_code}")
+            return None
+            
     except Exception as e:
-        st.error(f"Erro ao salvar no banco: {e}")
-        return False
-
-def load_curves_from_database(supabase_client):
-    """Load latest curves data from Supabase"""
-    try:
-        result = supabase_client.table('anbima_curves').select('*').order('upload_date', desc=True).limit(1).execute()
-        
-        if result.data and len(result.data) > 0:
-            return result.data[0]['file_data']
-        return None
-    except Exception as e:
-        st.error(f"Erro ao carregar dados: {e}")
-        return None
-
-def process_excel_to_json(excel_file):
-    """Convert Excel file to JSON format for storage"""
-    import pandas as pd
-    
-    try:
-        xl_file = pd.ExcelFile(excel_file)
-        
-        data = {}
-        for sheet_name in xl_file.sheet_names:
-            df = pd.read_excel(excel_file, sheet_name=sheet_name)
-            # Store column order explicitly to preserve it
-            # This ensures Vértice (Anos) stays as first column
-            data[sheet_name] = {
-                'columns': df.columns.tolist(),  # Preserve column order
-                'data': df.to_dict('list')
-            }
-        
-        return data
-    except Exception as e:
-        st.error(f"Erro ao processar Excel: {e}")
+        st.error(f"❌ Erro ao baixar curvas do GitHub: {e}")
         return None
 
 def json_to_dataframes(json_data):
@@ -2489,63 +2464,37 @@ def calculate_curves_variations(df):
 # CREDIT CURVES FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def save_credit_curves_to_database(supabase_client, file_data, uploaded_by="admin"):
-    """Save credit curves to database"""
-    if not supabase_client:
-        return False
-    
+def download_credit_curves_from_github():
+    """Download curvas_credito.xlsx from GitHub Release"""
     try:
-        # Delete old data
-        supabase_client.table('credito_curves').delete().neq('id', 0).execute()
+        url = "https://github.com/ViniHorstFer/Monitor_App/releases/download/data/curvas_credito.xlsx"
+        response = requests.get(url, timeout=30)
         
-        # Insert new data
-        data = {'file_data': file_data, 'uploaded_by': uploaded_by}
-        result = supabase_client.table('credito_curves').insert(data).execute()
-        return True
-    except Exception as e:
-        st.error(f"Erro ao salvar: {e}")
-        return False
-
-def load_credit_curves_from_database(supabase_client):
-    """Load latest credit curves from database"""
-    if not supabase_client:
-        return None
-    
-    try:
-        result = supabase_client.table('credito_curves').select('*').order('upload_date', desc=True).limit(1).execute()
-        
-        if result.data and len(result.data) > 0:
-            return result.data[0]['file_data']
-        return None
-    except Exception as e:
-        st.error(f"Erro ao carregar dados: {e}")
-        return None
-
-def process_credit_excel_to_json(excel_file):
-    """Convert credit Excel file to JSON format, removing rows with NaN"""
-    import pandas as pd
-    
-    try:
-        xl_file = pd.ExcelFile(excel_file)
-        
-        data = {}
-        for sheet_name in xl_file.sheet_names:
-            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+        if response.status_code == 200:
+            # Convert to JSON format
+            excel_file = BytesIO(response.content)
+            xl_file = pd.ExcelFile(excel_file)
             
-            # Remove rows where ANY date column has NaN
-            # Keep Vértice column, check only date columns (1 onwards)
-            date_columns = df.columns[1:]
-            df_clean = df.dropna(subset=date_columns, how='any')
+            data = {}
+            for sheet_name in xl_file.sheet_names:
+                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                
+                # Remove rows where ANY date column has NaN
+                date_columns = df.columns[1:]
+                df_clean = df.dropna(subset=date_columns, how='any')
+                
+                data[sheet_name] = {
+                    'columns': df_clean.columns.tolist(),
+                    'data': df_clean.to_dict('list')
+                }
             
-            # Store with explicit column order
-            data[sheet_name] = {
-                'columns': df_clean.columns.tolist(),
-                'data': df_clean.to_dict('list')
-            }
-        
-        return data
+            return data
+        else:
+            st.error(f"❌ Erro ao baixar curvas_credito.xlsx: HTTP {response.status_code}")
+            return None
+            
     except Exception as e:
-        st.error(f"Erro ao processar Excel: {e}")
+        st.error(f"❌ Erro ao baixar curvas de crédito do GitHub: {e}")
         return None
 
 def create_credit_comparison_chart(dataframes, selected_date):
@@ -3840,70 +3789,29 @@ def show_dashboard():
     with tab2:
         st.header("📈 Análise de Curvas ANBIMA")
         
-        # Check if user is admin
-        is_admin = st.session_state.get('user_logged_in') == 'admin'
+        # Refresh button
+        if st.button("🔄 Atualizar Dados", use_container_width=True, key='refresh_curves'):
+            st.session_state.curves_data_cache = None
+            st.rerun()
         
-        # Initialize Supabase client
-        supabase_client = init_supabase_client()
+        st.markdown("---")
         
-        
-        # Admin upload section
-        if is_admin:
-            st.markdown("### 🔐 Área do Administrador")
-            
-            uploaded_excel = st.file_uploader(
-                "Upload arquivo Excel com curvas ANBIMA",
-                type=['xlsx', 'xls'],
-                key='curves_excel',
-                help="Arquivo deve conter 3 sheets: 'ETTJ PRE', 'ETTJ IPCA', 'Inflação Implícita'"
-            )
-            
-            if uploaded_excel:
-                if st.button("💾 Salvar Curvas no Banco", type="primary"):
-                    with st.spinner("Processando e salvando..."):
-                        json_data = process_excel_to_json(uploaded_excel)
-                        if json_data and supabase_client:
-                            if save_curves_to_database(supabase_client, json_data):
-                                st.success("✅ Curvas salvas com sucesso!")
-                                # Clear cache so new data is loaded
-                                st.session_state.curves_data_cache = None
-                                st.rerun()
-                            else:
-                                st.error("❌ Erro ao salvar curvas")
-                        elif not supabase_client:
-                            st.error("❌ Cliente Supabase não inicializado")
-            
-            st.markdown("---")
-            
-            # Add refresh button for admin
-            if st.button("🔄 Recarregar Dados do Banco", use_container_width=True):
-                st.session_state.curves_data_cache = None
-                st.success("✅ Cache limpo! Dados serão recarregados.")
-                st.rerun()
-        
-        # Load curves data (use session state to avoid reloading on every button click)
+        # Load curves data from GitHub (use session state cache)
         if 'curves_data_cache' not in st.session_state:
             st.session_state.curves_data_cache = None
         
-        # Only load from database if not in cache
+        # Only download if not in cache
         if st.session_state.curves_data_cache is None:
-            if supabase_client:
-                try:
-                    curves_data = load_curves_from_database(supabase_client)
-                    if curves_data:
-                        st.session_state.curves_data_cache = curves_data
-                except Exception as e:
-                    st.error(f"Erro ao carregar dados: {e}")
-                    curves_data = None
-            else:
-                curves_data = None
+            with st.spinner("Carregando..."):
+                curves_data = download_curves_from_github()
+                if curves_data:
+                    st.session_state.curves_data_cache = curves_data
         else:
             curves_data = st.session_state.curves_data_cache
         
         if not curves_data:
-            st.warning("⚠️ Nenhuma curva disponível.")
-            if not is_admin:
-                st.info("💡 Aguardando upload do administrador.")
+            st.error("❌ Não foi possível carregar as curvas de juros.")
+            st.stop()
         else:
             # Convert JSON to DataFrames
             dataframes = json_to_dataframes(curves_data)
@@ -4058,69 +3966,29 @@ def show_dashboard():
     with tab3:
         st.header("📊 Análise de Curvas de Crédito")
         
-        # Check if user is admin
-        is_admin = st.session_state.get('user_logged_in') == 'admin'
+        # Refresh button
+        if st.button("🔄 Atualizar Dados", use_container_width=True, key='refresh_credit_curves'):
+            st.session_state.credit_curves_data_cache = None
+            st.rerun()
         
-        # Initialize Supabase client
-        supabase_client = init_supabase_client()
+        st.markdown("---")
         
-        # Admin upload section
-        if is_admin:
-            st.markdown("### 🔐 Área do Administrador")
-            
-            uploaded_excel = st.file_uploader(
-                "Upload arquivo Excel com curvas de crédito",
-                type=['xlsx', 'xls'],
-                key='credit_curves_excel',
-                help="Arquivo deve conter 3 sheets: 'AAA', 'AA', 'A'"
-            )
-            
-            if uploaded_excel:
-                if st.button("💾 Salvar Curvas de Crédito no Banco", type="primary"):
-                    with st.spinner("Processando e salvando..."):
-                        json_data = process_credit_excel_to_json(uploaded_excel)
-                        if json_data and supabase_client:
-                            if save_credit_curves_to_database(supabase_client, json_data):
-                                st.success("✅ Curvas de crédito salvas com sucesso!")
-                                # Clear cache
-                                st.session_state.credit_curves_data_cache = None
-                                st.rerun()
-                            else:
-                                st.error("❌ Erro ao salvar curvas de crédito")
-                        elif not supabase_client:
-                            st.error("❌ Cliente Supabase não inicializado")
-            
-            st.markdown("---")
-            
-            # Add refresh button for admin
-            if st.button("🔄 Recarregar Dados de Crédito do Banco", use_container_width=True):
-                st.session_state.credit_curves_data_cache = None
-                st.success("✅ Cache limpo! Dados serão recarregados.")
-                st.rerun()
-        
-        # Load credit curves data (use session state to avoid reloading)
+        # Load credit curves data from GitHub (use session state cache)
         if 'credit_curves_data_cache' not in st.session_state:
             st.session_state.credit_curves_data_cache = None
         
-        # Only load from database if not in cache
+        # Only download if not in cache
         if st.session_state.credit_curves_data_cache is None:
-            if supabase_client:
-                try:
-                    credit_curves_data = load_credit_curves_from_database(supabase_client)
-                    if credit_curves_data:
-                        st.session_state.credit_curves_data_cache = credit_curves_data
-                except Exception as e:
-                    st.error(f"Erro ao carregar dados: {e}")
-                    credit_curves_data = None
-            else:
-                credit_curves_data = None
+            with st.spinner("Carregando..."):
+                credit_curves_data = download_credit_curves_from_github()
+                if credit_curves_data:
+                    st.session_state.credit_curves_data_cache = credit_curves_data
         else:
             credit_curves_data = st.session_state.credit_curves_data_cache
         
         if not credit_curves_data:
-            st.warning("⚠️ Nenhuma curva de crédito disponível.")
-            if not is_admin:
-                st.info("💡 Aguardando upload do administrador.")
+            st.error("❌ Não foi possível carregar as curvas de crédito.")
+            st.stop()
         else:
             # Convert JSON to DataFrames
             dataframes = json_to_dataframes(credit_curves_data)
@@ -4131,6 +3999,7 @@ def show_dashboard():
                 available_dates = sample_df.columns[1:].tolist() if sample_df is not None else []
                 
                 # Create 4 main buttons
+                st.markdown("### 📊 Visualização de Dados")
                 col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
@@ -4159,7 +4028,7 @@ def show_dashboard():
                 # SECTION 1: COMPARATIVO
                 # ═══════════════════════════════════════════════════════════════
                 if st.session_state.credit_view == 'comparativo':
-                    st.subheader("Comparativo de Ratings")
+                    st.subheader("📊 Comparativo de Ratings")
                     
                     # Date selector
                     selected_date = st.selectbox(
@@ -4638,19 +4507,14 @@ def show_dashboard():
         # Check if user is admin
         is_admin = st.session_state.get('user_logged_in') == 'admin'
         
-        # Try to load saved data from database first
-        saved_data = None
-        if supabase_client:
-            saved_data = load_noticiario_from_database(supabase_client)
-        
         # Admin section - upload and save
         if is_admin:
-            st.markdown("#### 🔐 Admin: Upload e Salvar Novo Noticiário")
+            st.markdown("#### 🔐 Admin: Upload Noticiário")
             
             uploaded_file = st.file_uploader(
                 "Escolha o arquivo HTML",
                 type=['html', 'htm'],
-                help="Arquivo HTML do noticiário semanal de renda fixa",
+                help="Arquivo HTML do noticiário de renda fixa",
                 key='admin_upload'
             )
             
@@ -4660,72 +4524,43 @@ def show_dashboard():
                     html_content = uploaded_file.read().decode('utf-8')
                     
                     # Parse the content
-                    with st.spinner("📖 Processando o noticiário..."):
+                    with st.spinner("Processando..."):
                         daily_reports = parse_noticiario_renda_fixa(html_content)
                     
                     if daily_reports:
-                        st.success(f"✅ {len(daily_reports)} dia(s) de notícias encontrado(s)!")
-                        
                         # Save to database button
                         if supabase_client:
-                            if st.button("💾 Salvar no Banco de Dados (Substituir Anterior)", type="primary"):
+                            if st.button("💾 Salvar no Banco de Dados", type="primary"):
                                 with st.spinner("Salvando..."):
                                     if save_noticiario_to_database(supabase_client, html_content, daily_reports, "admin"):
-                                        st.success("✅ Noticiário salvo com sucesso! Todos os usuários verão esta versão.")
-                                        # Force reload
+                                        st.success("✅ Salvo com sucesso!")
                                         st.rerun()
                                     else:
-                                        st.error("❌ Erro ao salvar no banco de dados.")
-                        
-                        # Display the reports
-                        st.markdown("---")
-                        st.markdown("#### Preview:")
-                        display_noticiario_renda_fixa(daily_reports)
+                                        st.error("❌ Erro ao salvar.")
                     else:
-                        st.warning("⚠️ Nenhuma notícia foi encontrada no arquivo. Verifique o formato.")
+                        st.warning("⚠️ Nenhuma notícia encontrada.")
                         
                 except Exception as e:
-                    st.error(f"❌ Erro ao processar o arquivo: {str(e)}")
-                    import traceback
-                    st.error(traceback.format_exc())
+                    st.error(f"❌ Erro ao processar: {str(e)}")
             
             st.markdown("---")
         
-        # Display section - show saved data or instructions
-        if saved_data:
-            # Show when it was uploaded
-            upload_date = saved_data.get('upload_date', '')
-            if upload_date:
-                upload_datetime = datetime.fromisoformat(upload_date)
-                formatted_date = upload_datetime.strftime("%d/%m/%Y às %H:%M")
+        # Load and display saved data
+        if supabase_client:
+            saved_data = load_noticiario_from_database(supabase_client)
             
-            # Display the saved reports
-            parsed_data = saved_data.get('parsed_data', [])
-            if parsed_data:
-                display_noticiario_renda_fixa(parsed_data)
+            if saved_data:
+                # Display the saved reports
+                parsed_data = saved_data.get('parsed_data', [])
+                if parsed_data:
+                    display_noticiario_renda_fixa(parsed_data)
+                else:
+                    st.warning("⚠️ Nenhum dado disponível.")
             else:
-                st.warning("⚠️ Dados salvos não puderam ser exibidos.")
+                if not is_admin:
+                    st.info("💡 Aguardando upload do administrador.")
         else:
-            # No saved data - show instructions
-            if not is_admin:
-                st.info("""
-                **Aguardando primeiro upload**
-                
-                O administrador ainda não fez upload do noticiário semanal.
-                Assim que disponível, as notícias aparecerão aqui automaticamente.
-                """)
-            else:
-                st.info("""
-                **Como usar:**
-                1. Faça upload do arquivo HTML do noticiário semanal
-                2. O sistema irá extrair automaticamente as notícias organizadas por dia
-                3. Clique em "Salvar no Banco de Dados" para disponibilizar para todos os usuários
-                4. Cada dia terá as seguintes seções:
-                   - 📊 **Leitura da Curva**: Análise dos juros futuros
-                   - 🌍 **Mercados Globais**: Notícias internacionais
-                   - 📍 **Mercado Doméstico**: Notícias do Brasil
-                   - 📰 **Noticiário Corporativo**: Notícias por setor
-                """)
+            st.error("❌ Erro ao conectar ao banco de dados.")
     
 
 # MAIN APP LOGIC
@@ -4735,11 +4570,3 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
-
-
-
-
-
-
-
-
