@@ -468,12 +468,41 @@ def baixar_indice(indice, name, source, start_date='2015-01-01'):
         return df.loc[df.index > start_date]
     
     elif source == 'yf':
-        df = yf.download(indice, start=start_date, end=datetime.today(), interval='1d', progress=False)['Close']
-        if isinstance(df, pd.Series):
-            df = df.to_frame(name=name)
-        else:
-            df.columns = [name]
-        return df
+        # Add retry logic for Yahoo Finance (can be flaky)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                df = yf.download(
+                    indice, 
+                    start=start_date, 
+                    end=datetime.today(), 
+                    interval='1d', 
+                    progress=False,
+                    auto_adjust=True,  # Use adjusted close
+                    actions=False,     # Don't download dividends/splits
+                    timeout=10         # Set timeout
+                )['Close']
+                
+                # Check if download was successful
+                if df is not None and not df.empty:
+                    if isinstance(df, pd.Series):
+                        df = df.to_frame(name=name)
+                    else:
+                        df.columns = [name]
+                    return df
+                else:
+                    if attempt < max_retries - 1:
+                        time.sleep(1)  # Wait before retry
+                        continue
+                    else:
+                        raise ValueError(f"Empty data returned for {name}")
+                        
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Wait before retry
+                    continue
+                else:
+                    raise Exception(f"Failed to download {name} after {max_retries} attempts: {str(e)}")
     
     elif source == 'bcb':
         serie_codigo = 12
