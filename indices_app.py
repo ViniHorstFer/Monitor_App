@@ -197,12 +197,33 @@ def load_tesouro_direto_data():
     """Load Tesouro Direto data from government API"""
     try:
         url_td = "https://www.tesourotransparente.gov.br/ckan/dataset/df56aa42-484a-4a59-8184-7676580c81e3/resource/796d2059-14e9-44e3-80c9-2d9e30b405c1/download/precotaxatesourodireto.csv"
-        td_df = pd.read_csv(url_td, encoding='utf-8', sep=';')
+        
+        # Headers to mimic a real browser
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        # Download with headers
+        response = requests.get(url_td, headers=headers, timeout=30)
+        response.raise_for_status()  # Raise exception for bad status codes
+        
+        # Read CSV from response content
+        from io import StringIO
+        td_df = pd.read_csv(StringIO(response.text), encoding='utf-8', sep=';')
         td_df['Data Base'] = pd.to_datetime(td_df['Data Base'], dayfirst=True).dt.date
         td_df['Data Vencimento'] = pd.to_datetime(td_df['Data Vencimento'], dayfirst=True).dt.date
         return td_df
+    except requests.exceptions.HTTPError as e:
+        st.error(f"❌ Erro HTTP ao acessar Tesouro Direto: {e.response.status_code}")
+        return None
     except Exception as e:
-        st.error(f"Erro ao carregar dados do Tesouro Direto: {str(e)}")
+        st.error(f"❌ Erro ao carregar dados do Tesouro Direto: {str(e)}")
         return None
 
 def products_td(td_df, bond):
@@ -1916,7 +1937,7 @@ def parse_noticiario_renda_fixa(html_content):
                     'leitura_da_curva': {'title': 'LEITURA DA CURVA', 'content': ''},
                     'mercados_globais': {'title': 'MERCADOS GLOBAIS', 'items': []},
                     'mercado_domestico': {'title': 'MERCADO DOMÉSTICO', 'items': []},
-                    'noticiario_corporativo': {'title': 'NOTICIÁRIO CORPORATIVO', 'subsections': {}}
+                    'noticiario_corporativo': {'title': 'SETORES E EMPRESAS', 'subsections': {}}
                 }
             }
             
@@ -1974,10 +1995,10 @@ def parse_noticiario_renda_fixa(html_content):
                             # Handle "MERCADO DOMÉSTICO" which might be split across multiple <strong> tags
                             current_section = 'mercado_domestico'
                             current_subsection = None
-                        elif 'NOTICIÁRIO CORPORATIVO' in combined_strong_text:
+                        elif 'NOTICIÁRIO CORPORATIVO' in combined_strong_text or 'SETORES E EMPRESAS' in combined_strong_text:
                             current_section = 'noticiario_corporativo'
                             current_subsection = None
-                        # Check for subsections in NOTICIÁRIO CORPORATIVO (e.g., "| Agronegócio")
+                        # Check for subsections in NOTICIÁRIO CORPORATIVO/SETORES E EMPRESAS (e.g., "| Agronegócio")
                         elif current_section == 'noticiario_corporativo' and combined_strong_text.startswith('|'):
                             # Extract subsection name (remove the "|" and trim)
                             current_subsection = combined_strong_text[1:].strip()
@@ -2248,7 +2269,7 @@ def display_noticiario_renda_fixa(daily_reports):
             if report['sections']['mercado_domestico']['items']:
                 st.markdown(f"""
                     <div class="section-box">
-                        <div class="section-title">🇧🇷 {report['sections']['mercado_domestico']['title']}</div>
+                        <div class="section-title">📍 {report['sections']['mercado_domestico']['title']}</div>
                 """, unsafe_allow_html=True)
                 
                 for item in report['sections']['mercado_domestico']['items']:
