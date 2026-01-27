@@ -2641,7 +2641,6 @@ def create_credit_comparison_chart(dataframes, selected_date):
             ))
     
     fig.update_layout(
-        title=f'Comparativo de Spreads - {selected_date}',
         xaxis_title='Vértice (Anos)',
         yaxis_title='Spread (%)',
         plot_bgcolor='#0a0a0a',
@@ -4681,5 +4680,6 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
 
 
