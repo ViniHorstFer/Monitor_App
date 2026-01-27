@@ -1088,16 +1088,12 @@ def init_supabase_client():
     supabase_url = SUPABASE_URL
     supabase_key = SUPABASE_KEY
     
-    st.info(f"🔍 DEBUG: SUPABASE_URL = {supabase_url[:30] + '...' if supabase_url else 'None'}")
-    st.info(f"🔍 DEBUG: SUPABASE_KEY = {'***' + supabase_key[-10:] if supabase_key else 'None'}")
-    
     if not supabase_url or not supabase_key:
         st.warning("⚠️ Supabase credentials not found. Database features disabled.")
         return None
     
     try:
         client = create_client(supabase_url, supabase_key)
-        st.success("✅ DEBUG: Supabase client created successfully!")
         return client
     except Exception as e:
         st.error(f"❌ DEBUG: Could not connect to Supabase: {e}")
@@ -4120,7 +4116,6 @@ def show_dashboard():
                 available_dates = sample_df.columns[1:].tolist() if sample_df is not None else []
                 
                 # Create 4 main buttons
-                st.markdown("### 📊 Visualização de Dados")
                 col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
@@ -4149,8 +4144,7 @@ def show_dashboard():
                 # SECTION 1: COMPARATIVO
                 # ═══════════════════════════════════════════════════════════════
                 if st.session_state.credit_view == 'comparativo':
-                    st.subheader("📊 Comparativo de Ratings")
-                    
+                   
                     # Date selector
                     selected_date = st.selectbox(
                         "Selecione o Dia de Referência",
@@ -4399,9 +4393,7 @@ def show_dashboard():
             products_df = products_td(td_df, selected_bond)
             
             if products_df is not None and len(products_df) > 0:
-                # 1. Display curve chart
-                st.markdown("### 📊 Gráfico da Curva de Taxas")
-                
+                # 1. Display curve chart                
                 # Get available dates (last 10 trading days)
                 available_dates = list(products_df.index)
                 
@@ -4691,3 +4683,4 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
