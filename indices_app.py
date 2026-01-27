@@ -2532,7 +2532,6 @@ def create_curves_chart(df, index_name):
         ))
     
     fig.update_layout(
-        title=index_name,
         xaxis_title='Vértice (Anos)',
         yaxis_title='Taxa (%)',
         plot_bgcolor='#0a0a0a',
@@ -3962,7 +3961,6 @@ def show_dashboard():
                 
                 if df is not None:
                     # 1. Display curve chart
-                    st.markdown("### 📊 Gráfico da Curva")
                     fig = create_curves_chart(df, selected_curve)
                     if fig:
                         st.plotly_chart(fig, use_container_width=True)
@@ -4683,4 +4681,5 @@ if not st.session_state.started or not st.session_state.authenticated:
     show_landing_page()
 else:
     show_dashboard()
+
 
