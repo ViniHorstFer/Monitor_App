@@ -214,7 +214,6 @@ def load_tesouro_direto_data():
         response.raise_for_status()  # Raise exception for bad status codes
         
         # Read CSV from response content
-        from io import StringIO
         td_df = pd.read_csv(StringIO(response.text), encoding='utf-8', sep=';')
         td_df['Data Base'] = pd.to_datetime(td_df['Data Base'], dayfirst=True).dt.date
         td_df['Data Vencimento'] = pd.to_datetime(td_df['Data Vencimento'], dayfirst=True).dt.date
@@ -467,6 +466,47 @@ def baixar_indice(indice, name, source, start_date='2015-01-01'):
         df.rename(columns={'Número Índice': name}, inplace=True)
         return df.loc[df.index > start_date]
     
+    elif source == 'b3':
+        # B3 historical data for Ibovespa - Using Yahoo Finance with enhanced reliability
+        max_retries = 5  # More retries for Ibovespa
+        for attempt in range(max_retries):
+            try:
+                # Use Yahoo Finance but with longer delays and more retries
+                df = yf.download(
+                    '^BVSP',  # Ibovespa ticker
+                    start=start_date, 
+                    end=datetime.today(), 
+                    interval='1d', 
+                    progress=False,
+                    auto_adjust=False,  # Don't auto-adjust
+                    actions=False,
+                    timeout=15
+                )
+                
+                # Yahoo Finance returns a DataFrame with columns or Series
+                if df is not None and not df.empty:
+                    # Get Close column
+                    if 'Close' in df.columns:
+                        df = df[['Close']].copy()
+                    elif isinstance(df, pd.Series):
+                        df = df.to_frame()
+                    
+                    df.columns = [name]
+                    return df
+                else:
+                    if attempt < max_retries - 1:
+                        time.sleep(3)  # Longer wait between retries
+                        continue
+                    else:
+                        raise ValueError(f"Empty data returned for {name}")
+                        
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(3)  # Longer wait between retries
+                    continue
+                else:
+                    raise Exception(f"Failed to download {name} after {max_retries} attempts: {str(e)}")
+    
     elif source == 'yf':
         # Add retry logic for Yahoo Finance (can be flaky)
         max_retries = 3
@@ -562,9 +602,9 @@ def load_all_indices():
             except Exception as e:
                 st.warning(f"Não foi possível carregar {name}: {str(e)}")
         
-        # Yahoo Finance indices
+        # Yahoo Finance indices (excluding Ibovespa - now using B3)
         yf_indices = [
-            ('^BVSP', 'IBOVESPA'), ('^GSPC', 'S&P 500 (USD)'), ('BRL=X', 'USD/BRL'), ('BTC-USD', 'BITCOIN'), ('GLD', 'OURO'), ('EUE.MI', 'STOXX50')
+            ('^GSPC', 'S&P 500 (USD)'), ('BRL=X', 'USD/BRL'), ('BTC-USD', 'BITCOIN'), ('GLD', 'OURO'), ('EUE.MI', 'STOXX50')
         ]
         
         for code, name in yf_indices:
@@ -572,6 +612,12 @@ def load_all_indices():
                 indices_data[name] = baixar_indice(code, name, 'yf')
             except Exception as e:
                 st.warning(f"Não foi possível carregar {name}: {str(e)}")
+        
+        # B3 indices (Ibovespa)
+        try:
+            indices_data['IBOVESPA'] = baixar_indice('^BVSP', 'IBOVESPA', 'b3')
+        except Exception as e:
+            st.warning(f"Não foi possível carregar IBOVESPA: {str(e)}")
         
         # CDI
         try:
@@ -849,13 +895,13 @@ def calculate_cumulative_returns_daily(indices_data, selected_indices, period):
     elif period == '120M':
         start_date = end_date - relativedelta(months=120)
     elif period == 'Tudo':
+        # For "Tudo", find the earliest common date where at least one index has data
         earliest_dates = []
         for idx_name in selected_indices:
             if idx_name in indices_data and indices_data[idx_name] is not None:
                 df = indices_data[idx_name]
                 if len(df) > 0 and hasattr(df.index, 'min'):
                     min_date = df.index.min()
-                    # Only add if it's a valid Timestamp
                     if pd.notna(min_date) and isinstance(min_date, pd.Timestamp):
                         earliest_dates.append(min_date)
         
@@ -882,6 +928,7 @@ def calculate_cumulative_returns_daily(indices_data, selected_indices, period):
     if not all_data:
         return pd.DataFrame()
     
+    # Collect all unique dates from all indices
     all_dates = set()
     for df in all_data.values():
         all_dates.update(df.index)
@@ -893,12 +940,30 @@ def calculate_cumulative_returns_daily(indices_data, selected_indices, period):
     
     for idx_name, df in all_data.items():
         col = df.columns[0]
-        prices = df[col].reindex(date_range, method='ffill')
-        daily_returns = prices.pct_change()
-        daily_returns = daily_returns.fillna(0)
         
-        first_price = prices.iloc[0]
-        cumulative_returns[idx_name] = ((prices / first_price) - 1) * 100
+        # Get the prices for this index
+        prices = df[col].reindex(date_range)
+        
+        # Forward fill to handle missing dates (weekends, holidays)
+        prices = prices.ffill()
+        
+        # Find the first valid price for THIS index
+        first_valid_idx = prices.first_valid_index()
+        
+        if first_valid_idx is None:
+            continue
+        
+        # Get first valid price
+        first_price = prices.loc[first_valid_idx]
+        
+        # Calculate cumulative returns only from the first valid date onwards
+        cum_returns = ((prices / first_price) - 1) * 100
+        
+        # Set returns to NaN before the first valid date for this index
+        cum_returns.loc[:first_valid_idx] = np.nan
+        cum_returns.loc[first_valid_idx] = 0.0  # Start at 0%
+        
+        cumulative_returns[idx_name] = cum_returns
     
     return cumulative_returns
 
@@ -1023,12 +1088,16 @@ def init_supabase_client():
     supabase_url = SUPABASE_URL
     supabase_key = SUPABASE_KEY
     
+    st.info(f"🔍 DEBUG: SUPABASE_URL = {supabase_url[:30] + '...' if supabase_url else 'None'}")
+    st.info(f"🔍 DEBUG: SUPABASE_KEY = {'***' + supabase_key[-10:] if supabase_key else 'None'}")
+    
     if not supabase_url or not supabase_key:
         st.warning("⚠️ Supabase credentials not found. Database features disabled.")
         return None
     
     try:
         client = create_client(supabase_url, supabase_key)
+        st.success("✅ DEBUG: Supabase client created successfully!")
         return client
     except Exception as e:
         st.error(f"❌ DEBUG: Could not connect to Supabase: {e}")
@@ -2298,7 +2367,7 @@ def display_noticiario_renda_fixa(daily_reports):
             if report['sections']['mercado_domestico']['items']:
                 st.markdown(f"""
                     <div class="section-box">
-                        <div class="section-title">📍 {report['sections']['mercado_domestico']['title']}</div>
+                        <div class="section-title">🇧🇷 {report['sections']['mercado_domestico']['title']}</div>
                 """, unsafe_allow_html=True)
                 
                 for item in report['sections']['mercado_domestico']['items']:
@@ -3565,24 +3634,86 @@ def show_dashboard():
         else:
             st.info("Por favor, selecione pelo menos um índice.")
         
-        # Rankings
-        st.header("🏆 Rankings de Performance")
+        # Rankings and Monitor - All side by side
+        st.header("📊 Monitores e Rankings")
         
+        # Prepare data for all three tables
+        variation_data = []
         all_returns = {}
-        for name, df in indices_data.items():
-            if df is not None and len(df) > 0:
-                returns = calc_returns(df)
-                all_returns[name] = returns
         
+        for name, df in indices_data.items():
+            if df is not None and len(df) >= 1:
+                # Monitor data
+                last_date = df.index.max()
+                last_value = df.iloc[-1, 0]
+                
+                # Get daily variation if we have at least 2 data points
+                if len(df) >= 2:
+                    result = get_daily_variation(df)
+                    if result and len(result) == 5:
+                        _, _, _, _, variation = result
+                    else:
+                        variation = 0.0
+                else:
+                    variation = 0.0
+                
+                variation_data.append({
+                    'Índice': name,
+                    'Valor': last_value,
+                    'Variação': variation,
+                    'Última atualização': last_date.strftime('%d/%m/%Y')
+                })
+                
+                # Returns data
+                if len(df) > 0:
+                    returns = calc_returns(df)
+                    all_returns[name] = returns
+        
+        # Prepare MTD and YTD rankings
         mtd_returns = pd.DataFrame({name: returns.loc['MTD'].values[0] for name, returns in all_returns.items()}, index=['Return']).T
         ytd_returns = pd.DataFrame({name: returns.loc['YTD'].values[0] for name, returns in all_returns.items()}, index=['Return']).T
         
         mtd_returns = mtd_returns.sort_values('Return', ascending=False)
         ytd_returns = ytd_returns.sort_values('Return', ascending=False)
         
-        col1, col2 = st.columns(2)
+        # Create 3 columns
+        col1, col2, col3 = st.columns(3)
         
+        # Column 1: Monitor de Variação Diária
         with col1:
+            st.subheader("📡 Monitor Diário")
+            
+            if variation_data:
+                var_df = pd.DataFrame(variation_data)
+                var_df = var_df.sort_values('Variação', ascending=False)
+                
+                html_table = '<table style="width:100%; border-collapse: collapse; font-size: 18px;">'
+                html_table += '<thead><tr style="background-color: #0a0a0a;">'
+                html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Índice</th>'
+                html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37; text-align: right;">Valor</th>'
+                html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37; text-align: right;">Var.</th>'
+                html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37; text-align: center;">Data</th>'
+                html_table += '</tr></thead><tbody>'
+                
+                for _, row in var_df.iterrows():
+                    variation = row['Variação']
+                    color = '#00e100' if variation >= 0 else '#f20000'
+                    arrow = '▲' if variation >= 0 else '▼'
+                    
+                    html_table += '<tr>'
+                    html_table += f'<td style="border: 1px solid #333; padding: 8px; background-color: #1a1a1a; color: #d4af37; font-weight: bold; font-size: 15px;">{row["Índice"]}</td>'
+                    html_table += f'<td style="border: 1px solid #333; padding: 8px; text-align: right; background-color: #1a1a1a; color: #d4af37; font-size: 15px;">{row["Valor"]:.2f}</td>'
+                    html_table += f'<td style="border: 1px solid #333; padding: 8px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold; font-size: 15px;">{arrow} {abs(variation):.2f}%</td>'
+                    html_table += f'<td style="border: 1px solid #333; padding: 8px; text-align: center; background-color: #1a1a1a; color: #d4af37; font-size: 15px;">{row["Última atualização"]}</td>'
+                    html_table += '</tr>'
+                
+                html_table += '</tbody></table>'
+                st.markdown(html_table, unsafe_allow_html=True)
+            else:
+                st.warning("Sem dados")
+        
+        # Column 2: MTD Ranking
+        with col2:
             current_month = calendar.month_name[datetime.now().month]
             month_pt = {
                 'January': 'Janeiro', 'February': 'Fevereiro', 'March': 'Março',
@@ -3591,106 +3722,46 @@ def show_dashboard():
                 'October': 'Outubro', 'November': 'Novembro', 'December': 'Dezembro'
             }
             current_month_pt = month_pt.get(current_month, current_month)
-            st.subheader(f"🥇 Rankings de {current_month_pt} (MTD)")
+            st.subheader(f"🥇 {current_month_pt} (MTD)")
             
-            mtd_display = mtd_returns.copy()
-            mtd_display['Rank'] = range(1, len(mtd_display) + 1)
-            mtd_display = mtd_display[['Rank', 'Return']]
-            
-            html_table = '<table style="width:100%; border-collapse: collapse;">'
-            html_table += '<thead><tr style="background-color: #0a0a0a;"><th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Rank</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Índice</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Retorno</th></tr></thead><tbody>'
-            
-            for idx_name, row in mtd_display.iterrows():
-                ret_val = row['Return']
-                color = '#00e100' if ret_val >= 0 else '#f20000'
-                arrow = '▲' if ret_val >= 0 else '▼'
-                html_table += '<tr>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{int(row["Rank"])}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; background-color: #1a1a1a; color: #d4af37;">{idx_name}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {ret_val:.2f}%</td>'
-                html_table += '</tr>'
-            
-            html_table += '</tbody></table>'
-            st.markdown(html_table, unsafe_allow_html=True)
-        
-        with col2:
-            current_year = datetime.now().year
-            st.subheader(f"🥇 Rankings de {current_year} (YTD)")
-            
-            ytd_display = ytd_returns.copy()
-            ytd_display['Rank'] = range(1, len(ytd_display) + 1)
-            ytd_display = ytd_display[['Rank', 'Return']]
-            
-            html_table = '<table style="width:100%; border-collapse: collapse;">'
-            html_table += '<thead><tr style="background-color: #0a0a0a;"><th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Rank</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Índice</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Retorno</th></tr></thead><tbody>'
-            
-            for idx_name, row in ytd_display.iterrows():
-                ret_val = row['Return']
-                color = '#00e100' if ret_val >= 0 else '#f20000'
-                arrow = '▲' if ret_val >= 0 else '▼'
-                html_table += '<tr>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{int(row["Rank"])}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; background-color: #1a1a1a; color: #d4af37;">{idx_name}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {ret_val:.2f}%</td>'
-                html_table += '</tr>'
-            
-            html_table += '</tbody></table>'
-            st.markdown(html_table, unsafe_allow_html=True)
-        
-        # Variation Monitor
-        st.header("📡 Monitor de Variação Diária")
-        
-        variation_data = []
-        for name, df in indices_data.items():
-            if df is not None and len(df) >= 2:
-                result = get_daily_variation(df)
-                if result and len(result) == 5:
-                    last_date, last_value, prev_date, prev_value, variation = result
-                    variation_data.append({
-                        'Index': name,
-                        'Previous Date': prev_date.strftime('%Y-%m-%d'),
-                        'Previous Value': prev_value,
-                        'Last Date': last_date.strftime('%Y-%m-%d'),
-                        'Last Value': last_value,
-                        'Variation (%)': variation
-                    })
-        
-        if variation_data:
-            var_df = pd.DataFrame(variation_data)
-            var_df = var_df.sort_values('Variation (%)', ascending=False)
-            
-            html_table = '<table style="width:100%; border-collapse: collapse;">'
+            html_table = '<table style="width:100%; border-collapse: collapse; font-size: 18px;">'
             html_table += '<thead><tr style="background-color: #0a0a0a;">'
             html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Índice</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Data Anterior</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Valor Anterior</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Última Data</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Último Valor</th>'
-            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Variação</th>'
-            html_table += '</tr></thead><tbody>'
+            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37; text-align: right;">Retorno</th></tr></thead><tbody>'
             
-            for _, row in var_df.iterrows():
-                variation = row['Variation (%)']
-                color = '#00e100' if variation >= 0 else '#f20000'
-                arrow = '▲' if variation >= 0 else '▼'
-                
+            for idx_name, row in mtd_returns.iterrows():
+                ret_val = row['Return']
+                color = '#00e100' if ret_val >= 0 else '#f20000'
+                arrow = '▲' if ret_val >= 0 else '▼'
                 html_table += '<tr>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; background-color: #1a1a1a; color: #d4af37; font-weight: bold;">{row["Index"]}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{row["Previous Date"]}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: #d4af37;">{row["Previous Value"]:.2f}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: center; background-color: #1a1a1a; color: #d4af37;">{row["Last Date"]}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: #d4af37;">{row["Last Value"]:.2f}</td>'
-                html_table += f'<td style="border: 1px solid #333; padding: 10px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold;">{arrow} {abs(variation):.2f}%</td>'
+                html_table += f'<td style="border: 1px solid #333; padding: 8px; background-color: #1a1a1a; color: #d4af37; font-weight: bold; font-size: 15px;">{idx_name}</td>'
+                html_table += f'<td style="border: 1px solid #333; padding: 8px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold; font-size: 15px;">{arrow} {ret_val:.2f}%</td>'
                 html_table += '</tr>'
             
             html_table += '</tbody></table>'
             st.markdown(html_table, unsafe_allow_html=True)
-        else:
-            st.warning("Dados insuficientes para o monitor de variação.")
+        
+        # Column 3: YTD Ranking
+        with col3:
+            current_year = datetime.now().year
+            st.subheader(f"🥇 {current_year} (YTD)")
+            
+            html_table = '<table style="width:100%; border-collapse: collapse; font-size: 18px;">'
+            html_table += '<thead><tr style="background-color: #0a0a0a;">'
+            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37;">Índice</th>'
+            html_table += '<th style="border: 1px solid #d4af37; padding: 10px; color: #d4af37; text-align: right;">Retorno</th></tr></thead><tbody>'
+            
+            for idx_name, row in ytd_returns.iterrows():
+                ret_val = row['Return']
+                color = '#00e100' if ret_val >= 0 else '#f20000'
+                arrow = '▲' if ret_val >= 0 else '▼'
+                html_table += '<tr>'
+                html_table += f'<td style="border: 1px solid #333; padding: 8px; background-color: #1a1a1a; color: #d4af37; font-weight: bold; font-size: 15px;">{idx_name}</td>'
+                html_table += f'<td style="border: 1px solid #333; padding: 8px; text-align: right; background-color: #1a1a1a; color: {color}; font-weight: bold; font-size: 15px;">{arrow} {ret_val:.2f}%</td>'
+                html_table += '</tr>'
+            
+            html_table += '</tbody></table>'
+            st.markdown(html_table, unsafe_allow_html=True)
         
         # Monthly Matrix
         st.header("📅 Matriz de Performance Mensal (Últimos 12 Meses)")
